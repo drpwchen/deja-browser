@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edge-recipes"
+version = "0.1.0"
+description = "Learn a site's data path once in a real browser, replay it later without reading the page."
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = ["playwright>=1.45"]
+
+[project.optional-dependencies]
+stealth = ["patchright"]          # default driver when installed (hides Runtime.enable)
+keyring = ["keyring"]             # default secret backend
+audio = ["faster-whisper", "av<19"]   # reCAPTCHA audio; faster-whisper 1.2.1 passes av.open(metadata_errors=), removed in av 19
+ocr = ["ddddocr"]                 # text-image CAPTCHAs
+# hCaptcha (GPL-3.0, optional, installed by the user). PyPI 0.19.0 fails the drag challenges;
+# the tested build is git 28ee79b. Not installable from PyPI as an extra until upstream releases.
+# pip install "hcaptcha-challenger @ git+https://github.com/QIN2DIM/hcaptcha-challenger@28ee79b"
+dev = ["pytest"]
+
+[project.scripts]
+edge-recipes = "edge_recipes.recipe:main"
+edge-cdp = "edge_recipes.browser:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

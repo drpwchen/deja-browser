@@ -7,7 +7,7 @@
   this machine. Started on demand and left running afterwards — close_session only closes this
   session's tabs.
 
-  from edge_cdp import wb
+  from deja_browser.browser import wb
   wb("navigate", {"url": "https://example.com"}, session="my-task")   -> {success, url, tabId, title, status}
   wb("evaluate", {"code": "document.title"}, session="my-task")       -> {type, value}
   wb("close_session", {}, session="my-task")
@@ -37,10 +37,10 @@ process finds the same tab again. One CDP connection per process (lazy singleton
 Driver: playwright (default) or patchright (EDGE_CDP_DRIVER=patchright or use_driver()).
 
 CLI:
-  python edge_cdp.py launch            start the agent browser (e.g. to log in to a site by hand once)
-  python edge_cdp.py status            is CDP up? which version?
-  python edge_cdp.py stop              kill ONLY the agent-profile browser (refuses any other 9222 owner)
-  python edge_cdp.py <action> '<json args>' [--session S]
+  deja-cdp launch                     start the agent browser (e.g. to log in to a site by hand once)
+  deja-cdp status                     is CDP up? which version?
+  deja-cdp stop                       kill ONLY the agent-profile browser (refuses any other 9222 owner)
+  deja-cdp <action> '<json args>' [--session S]
 """
 import atexit, json, os, shutil, signal, subprocess, sys, tempfile, time, urllib.request
 from pathlib import Path

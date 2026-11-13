@@ -12,6 +12,7 @@ All notable changes to this project are documented here. The format follows
 - README rewritten for a first-time visitor: one-line pitch, badges, the demo GIF, four key points,
   a Quick start, a worked first recipe, and a comparison with browser-extension bridges. Detail
   sections follow, tightened; all links are absolute so the PyPI page renders them.
+- `deja-cdp --help` and `deja-browser --help` show the installed command names.
 
 ## [0.1.2] — 2026-11-14
 

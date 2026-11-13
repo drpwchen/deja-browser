@@ -36,12 +36,12 @@ auto-clear (lazy Turnstile scrolled into view) -> trusted checkbox click -> reCA
 whisper; text-image CAPTCHAs -> solve_image_captcha() (ddddocr). The human is the last resort.
 
 CLI:
-  python site_recipe.py list
-  python site_recipe.py show <id>
-  python site_recipe.py run <id> '<json args>' [--tier http|page|script] [--allow-write]
-  python site_recipe.py verify <draft.json> '<json args>'     try every tier, print shape + preview
-  python site_recipe.py save <draft.json>                     needs a passing verify of THIS draft
-  python site_recipe.py gate <url>                            open url, clear any challenge, report
+  deja-browser list
+  deja-browser show <id>
+  deja-browser run <id> '<json args>' [--tier http|page|script] [--allow-write]
+  deja-browser verify <draft.json> '<json args>'     try every tier, print shape + preview
+  deja-browser save <draft.json>                     needs a passing verify of THIS draft
+  deja-browser gate <url>                            open url, clear any challenge, report
 """
 import gzip, hashlib, importlib.util, json, os, re, sys, time, urllib.parse, urllib.request, zlib
 from datetime import datetime
@@ -50,7 +50,7 @@ from pathlib import Path
 # must precede the import: browser.py reads it once. patchright only if installed (optional dep).
 if importlib.util.find_spec("patchright"):
     os.environ.setdefault("EDGE_CDP_DRIVER", "patchright")
-from . import browser as edge_cdp  # noqa: E402
+from . import browser  # noqa: E402
 from . import config, guard, hcaptcha, notify, secretstore  # noqa: E402
 # patchright by default (2026-11-11 live test): with plain playwright the Cloudflare full-page
 # interstitial re-rendered its checkbox after the click (= rejected, Runtime.enable CDP signal);
@@ -488,23 +488,23 @@ def login_gate(page, login):
 
 def _page_for(recipe, session):
     """A tab on the recipe's entry origin (reused when already there)."""
-    ctx = edge_cdp._ctx()
+    ctx = browser._ctx()
     try:
-        page = edge_cdp._current(ctx, session)
+        page = browser._current(ctx, session)
         if urllib.parse.urlsplit(page.url)[:2] != urllib.parse.urlsplit(recipe["entry_url"])[:2]:
-            raise edge_cdp.NoTab("other origin")
-    except edge_cdp.NoTab:
-        edge_cdp.wb("navigate", {"url": recipe["entry_url"]}, session=session)
-        page = edge_cdp._current(ctx, session)
+            raise browser.NoTab("other origin")
+    except browser.NoTab:
+        browser.wb("navigate", {"url": recipe["entry_url"]}, session=session)
+        page = browser._current(ctx, session)
     return page
 
 
 def tier_http(recipe, args, session):
     req = _render(recipe["request"], args)
     url = req["url"]
-    ctx = edge_cdp._ctx()
+    ctx = browser._ctx()
     cookies = ctx.cookies(url)   # live from the agent browser; not stored anywhere
-    ua = (edge_cdp.version() or {}).get("User-Agent", "Mozilla/5.0")
+    ua = (browser.version() or {}).get("User-Agent", "Mozilla/5.0")
     headers = {"User-Agent": ua, "Accept": "application/json, */*", "Accept-Encoding": "gzip"}
     headers.update(req.get("headers") or {})
     if cookies:
@@ -569,9 +569,9 @@ def _ladder(recipe, start=None):
 
 def run(recipe, given, tier=None, allow_write=False, session=None, check_sig=True):
     _check_host(recipe["entry_url"])
-    if recipe.get("driver") and recipe["driver"] != edge_cdp._DRIVER:
-        edge_cdp.disconnect()
-        edge_cdp.use_driver(recipe["driver"])   # "patchright" for reCAPTCHA-v3-scored pages
+    if recipe.get("driver") and recipe["driver"] != browser._DRIVER:
+        browser.disconnect()
+        browser.use_driver(recipe["driver"])   # "patchright" for reCAPTCHA-v3-scored pages
     if recipe.get("writes") and not allow_write:
         raise RecipeError("this recipe has side effects — pass --allow-write")
     args = _args(recipe, given)
@@ -704,8 +704,8 @@ def cmd_list():
 
 def cmd_gate(url, session="recipe-gate"):
     _check_host(url)
-    edge_cdp.wb("navigate", {"url": url}, session=session)
-    page = edge_cdp._current(edge_cdp._ctx(), session)
+    browser.wb("navigate", {"url": url}, session=session)
+    page = browser._current(browser._ctx(), session)
     g = challenge_gate(page)
     return {**g, "url": page.url, "title": page.title(), "session": session}
 
@@ -740,7 +740,7 @@ def main(argv=None):
         else:
             print(__doc__)
             return 2
-    except (RecipeError, edge_cdp.WbError) as ex:
+    except (RecipeError, browser.WbError) as ex:
         print(json.dumps({"ok": False, "error": str(ex)}, ensure_ascii=False))
         return 1
     print(json.dumps(out, ensure_ascii=False))

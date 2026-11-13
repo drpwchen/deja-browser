@@ -26,6 +26,8 @@ Apple Silicon (Chrome) and Linux (headless Chromium).
 
 ## Quick start
 
+**Requirements & cost.** Python ≥ 3.11 and an installed Edge, Chrome, Chromium or Brave (Windows, macOS or Linux). Free (MIT), no accounts, no API keys; the only optional paid-account feature is the opt-in hCaptcha solver, which uses your own Gemini key.
+
 ```sh
 pip install "deja-browser[stealth,keyring]"
 
@@ -35,9 +37,13 @@ deja-cdp snapshot '{"max_chars": 2000}' --session demo              # what the a
 deja-cdp close_session '{}' --session demo                          # closes only this session's tabs
 ```
 
+Each command prints one line of JSON; the `snapshot` line holds the page text, cut to 2000 characters.
+
 Or let your agent do the setup. Tell it: *"Read
 https://github.com/drpwchen/deja-browser/blob/main/AGENTS.md and set this up with me."* It asks you
 the few choices that matter, has you log in to your sites by hand, and runs a smoke test.
+
+> 🧋 Saved you some time? [Buy me a drink](https://drpwchen.com/en/support/).
 
 ## Your first recipe
 
@@ -200,6 +206,14 @@ hcaptcha_solver = "gemini"
 Best effort: on the public demo the "drag the missing item into the grid" type passed 13/15, the
 hexagon shape-matching type 1/5 (small samples). Failures fall through to the human step.
 
+## Limitations
+
+- Early release (0.1). Linux is tested headless only; Firefox and Safari are not supported (no CDP).
+- Recipes are built per site by you or your agent; none ship with the package, and a site change can make a recipe stale (reported as stale, never returned as data).
+- The refused-host list is a guard rail, not a lock (see Safety model).
+- The CAPTCHA gate is best effort: the hCaptcha solver is opt-in and its pass rates above are from small samples. When it fails, it asks a human.
+- Page content your agent reads goes to its model provider; keep sensitive pages out of agent sessions.
+
 ## Acceptable use
 
 This is a personal automation tool for sites and accounts you are entitled to use. Respect each
@@ -223,3 +237,8 @@ sudo PY=$(which python) SELFTEST=1 tests/egress/run.sh # must FAIL: proves the c
 MIT — see [`LICENSE`](https://github.com/drpwchen/deja-browser/blob/main/LICENSE). Optional
 dependencies keep their own licenses; GPL-licensed packages are never vendored into this
 repository.
+
+## Support 支持
+
+If this tool helped you, you can [buy me a drink](https://drpwchen.com/en/support/) 🧋
+覺得這個工具有幫助嗎？歡迎[請我喝飲料](https://drpwchen.com/support/)。

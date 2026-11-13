@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-11-14
+
+### Docs
+- README quality pass: requirements and cost, expected quick-start output, a support line, a Limitations section and a Support footer.
+- Added `SECURITY.md` and a gitleaks secret-scan workflow.
+- No code changes (version strings bumped only).
+
 ## [0.1.3] — 2026-11-14
 
 ### Changed

@@ -30,8 +30,8 @@ class ConfigTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"DEJA_BROWSER_HOME": "~/somewhere"}):
             self.assertEqual(config.data_dir(), Path.home() / "somewhere")
 
-    def test_legacy_edge_recipes_names(self):
-        # 0.1.0 was called edge-recipes: old env vars and an existing old config/data dir still work
+    def test_legacy_names(self):
+        # 0.1.0 names: old env vars and an existing old config/data dir still work
         env = {k: v for k, v in os.environ.items() if not k.startswith(("DEJA_BROWSER_", "EDGE_RECIPES_"))}
         with mock.patch.dict(os.environ, env, clear=True):
             os.environ["EDGE_RECIPES_HOME"] = "~/old-home"

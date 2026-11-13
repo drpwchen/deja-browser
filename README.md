@@ -1,70 +1,106 @@
 # deja-browser
 
-*The agent browser that remembers.* (Formerly edge-recipes.)
+**Your AI agent gets its own browser — and remembers each site, so the next visit skips reading the page (~50× less text in the demo below).**
+
+[![PyPI](https://img.shields.io/pypi/v/deja-browser)](https://pypi.org/project/deja-browser/)
+[![Python](https://img.shields.io/pypi/pyversions/deja-browser)](https://pypi.org/project/deja-browser/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/drpwchen/deja-browser/blob/main/LICENSE)
 
 ![The same Hacker News search twice: the first visit reads a 29,427-character page tree, the recipe replay returns 588 characters of JSON without opening the page](https://raw.githubusercontent.com/drpwchen/deja-browser/main/docs/demo.gif)
 
-*Rendered from a real run against hn.algolia.com; wall times are the median of 3 runs.*
+*A real run against hn.algolia.com: first visit 29,427 characters of page for the model to read,
+recipe replay 588 characters of JSON. Wall time (median of 3) 3.5 s plus model reading vs 1.1 s.*
 
-**A browser for your AI agent that is not your browser.** A separate Chromium profile your agent
-drives over CDP — with no telemetry, no extension in your everyday browser, and site *recipes*
-so the second visit to a site does not need to read the page at all.
+- **Learn once, replay.** The first visit finds the site's JSON endpoint or form and saves it as a
+  *recipe*; later visits replay it without reading the page — **~50× less text** for the model.
+- **Not your browser.** A separate Chromium profile driven over CDP on `127.0.0.1`. No extension
+  in your everyday browser; your mail, bank and broker are simply not logged in there.
+- **No telemetry, tested.** [`tests/egress/run.sh`](https://github.com/drpwchen/deja-browser/blob/main/tests/egress/run.sh)
+  traces every `connect()` in a loopback-only network namespace and fails on anything else.
+- **No passwords in the browser.** Secrets stay in your OS keyring or password-manager CLI;
+  recipes only name them.
 
-Works with any agent that can run shell commands (Claude Code, Codex CLI, Gemini CLI, Cursor,
-Aider, …) and from plain Python.
+Works with any agent that can run shell commands — Claude Code, Codex CLI, Gemini CLI, Cursor,
+Aider — and from plain Python. MIT. **Early release (0.1)**: tested on Windows 11 (Edge), macOS on
+Apple Silicon (Chrome) and Linux (headless Chromium).
 
-> **Let your agent install it.** Tell it: *"Read
-> https://github.com/drpwchen/deja-browser/blob/main/AGENTS.md and set this up with me."* It will
-> ask you the few choices that matter, have you log in to your sites by hand, and run a smoke test.
+## Quick start
 
-> **Status: early release (0.1).** Tested on Windows 11 (Edge), macOS on Apple Silicon (Chrome)
-> and Linux (headless Chromium, in the egress test). Feedback and recipes-in-the-wild welcome.
+```sh
+pip install "deja-browser[stealth,keyring]"
 
-## Why
+deja-cdp launch                                                     # start the agent's browser
+deja-cdp navigate '{"url": "https://example.com"}' --session demo
+deja-cdp snapshot '{"max_chars": 2000}' --session demo              # what the agent reads
+deja-cdp close_session '{}' --session demo                          # closes only this session's tabs
+```
 
-Browser-extension bridges for agents put an extension with full debugger access into the browser
-where you are logged in to everything, and some of them phone home with no way to turn it off.
-Browsers have also stopped letting you fence such extensions away from chosen sites. deja-browser
-takes the other route:
+Or let your agent do the setup. Tell it: *"Read
+https://github.com/drpwchen/deja-browser/blob/main/AGENTS.md and set this up with me."* It asks you
+the few choices that matter, has you log in to your sites by hand, and runs a smoke test.
 
-- **Separation instead of a block list.** The agent gets its own profile. You log in there only to
-  the sites it should use. Your mail, bank and broker are simply not logged in.
-- **No telemetry, tested.** The tool makes no outbound connection of its own.
-  [`tests/egress/run.sh`](tests/egress/run.sh) runs every action and a full recipe cycle inside a
-  network namespace with only loopback, traces every `connect()` of the tool's processes, and
-  fails on anything that is not `127.0.0.1` (its `SELFTEST=1` mode proves the check catches a
-  deliberate connection). The only outbound features are ones you switch on: ntfy notifications
-  and the opt-in hCaptcha solver.
-- **No passwords in the browser.** On launch the profile's password, card and address autofill is
-  turned off, and a password-manager extension installed in it triggers a warning. Secrets the
-  agent may use stay in your OS keyring or password-manager CLI and are only named in recipes.
-- **Cheap to read.** Snapshots can be cut to one subtree, to interactive elements, or to lines
-  matching a word; screenshots and PDFs come back as file paths, never as inline images.
-- **Learn once, replay.** The first visit finds the JSON endpoint or the form; the recipe replays
-  it later, outside the browser when cookies are enough.
+## Your first recipe
+
+Save this as `draft.json` (a minimal recipe for the site in the GIF, using its public JSON API):
+
+```json
+{
+  "name": "search",
+  "description": "Hacker News full-text search (example)",
+  "entry_url": "https://hn.algolia.com/",
+  "params": [{"name": "q", "required": true}],
+  "request": {"method": "GET", "url": "https://hn.algolia.com/api/v1/search?query={q}"},
+  "pick": {"path": "hits", "fields": ["title", "url"], "limit": 20},
+  "writes": false
+}
+```
+
+```sh
+deja-browser verify draft.json '{"q": "rust"}'          # try every tier, print shape + preview
+deja-browser save draft.json                            # only after a passing verify of this draft
+deja-browser run hn.algolia.com/search '{"q": "rust"}'  # replay: titles + URLs, no page read
+deja-browser list
+```
+
+No recipes ship with the package — you (or your agent) build them per site, usually from a
+`network_capture` of the first visit. Recipes live in `<recipes dir>/<host>/<name>.json` and are
+addressed as `<host>/<name>`. `deja-browser --help` documents the full format.
+
+## Compared with browser-extension bridges
+
+| | Extension bridge | deja-browser |
+|---|---|---|
+| Where the agent acts | an extension with full debugger access, inside the browser where you are logged in to everything | its own profile, logged in only to the sites you chose |
+| Keeping it off sensitive sites | browsers no longer let you fence such extensions away from chosen sites | those sites are simply not logged in; a refused-host list as a guard rail |
+| Outbound traffic | some phone home with no way to turn it off | none of its own, checked by an egress test |
+| Repeat visits | read the page again | replay a recipe (~50× less text in the demo) |
 
 ## What it does
 
-- **Dedicated browser profile.** Drives any Chromium browser (Edge, Chrome, Chromium, Brave —
-  auto-detected) over CDP on `127.0.0.1` only, with its own user-data dir. Your everyday browser
-  profile is never touched. Kimi-WebBridge-compatible action names and return shapes, so scripts
-  written for that bridge port over.
+- **Dedicated profile, any Chromium.** Edge, Chrome, Chromium or Brave (auto-detected) over CDP on
+  `127.0.0.1` only, with its own user-data dir. Kimi-WebBridge-compatible action names and return
+  shapes, so scripts written for that bridge port over.
 - **Named sessions.** Every task names a session; its tabs are tracked across processes and
   `close_session` closes only those.
+- **Cheap to read.** Snapshots can be cut to one subtree, to interactive elements, or to lines
+  matching a word; screenshots and PDFs come back as file paths, never as inline images.
 - **API discovery.** `network_capture` records the requests one action triggers (bodies to files,
   credential headers redacted) — the raw material for a recipe.
-- **Recipes with a tier ladder** (cheapest first, falls through on failure, records what worked):
-  - `http` — plain HTTP outside the browser, with cookies read live from the browser (never stored)
-  - `page` — `fetch()` inside a tab on the site (native cookies, Cloudflare clearance, CSRF)
-  - `script` — the recipe's own JavaScript in the page (DOM read / form fill)
+- **Recipe tier ladder**, cheapest first, falling through on failure and recording what worked:
+  `http` (plain HTTP outside the browser, cookies read live from the browser, never stored) →
+  `page` (`fetch()` in a tab on the site: native cookies, Cloudflare clearance, CSRF) → `script`
+  (the recipe's own JavaScript in the page: DOM read / form fill).
 - **Shape checks.** Every response is compared with the JSON shape recorded at verify time; a
   mismatch is reported as *stale*, never returned as data.
 - **Write guard.** Recipes with side effects (`"writes": true`) only run with `--allow-write`.
-- **Secrets by name.** Recipes reference `{secret:NAME}`; values are resolved in-process and are
-  never printed or returned, and never typed into a refused host.
+- **Secrets by name.** Recipes reference `{secret:NAME}`; values are resolved in-process, never
+  printed or returned, and never typed into a refused host.
+- **No passwords in the profile.** On launch its password, card and address autofill is turned
+  off, and a password-manager extension installed in it triggers a warning.
 - **CAPTCHA gate.** Waits for Turnstile / Cloudflare to clear, then tries one trusted checkbox
   click. Local solvers (reCAPTCHA audio via `faster-whisper`, text CAPTCHAs via `ddddocr`) run only
   if you install those extras; the hCaptcha solver only if you enable it. Otherwise it notifies you.
+  `deja-browser gate <url>` opens a URL, clears any challenge and reports.
 - **Guard rails.** `navigate` and recipes refuse mail, account sign-in, banking, brokerage and
   payment hosts (built-in list, extendable); recipes also refuse ticketing / rail-booking hosts by
   default. These stop accidents, not attackers — see *Safety model*.
@@ -81,6 +117,30 @@ takes the other route:
 | CAPTCHA extras | `audio` (local), `ocr` (local), hCaptcha solver (cloud, opt-in) | none installed by default |
 | Agents | anything with a shell; Agent Skills folder in `skills/deja-browser/` | Python API: `from deja_browser.browser import wb` |
 
+## Install
+
+Requires Python ≥ 3.11 and a Chromium-based browser. `deja-browser` uses your installed browser;
+it does not need `playwright install`.
+
+```sh
+pip install deja-browser                      # core (playwright driver)
+pip install "deja-browser[stealth,keyring]"   # recommended: patchright driver + OS keyring secrets
+pip install "deja-browser[audio,ocr]"         # reCAPTCHA audio (faster-whisper), text CAPTCHAs (ddddocr)
+pip install -e ".[dev]"                       # from a clone: core + pytest
+python -m playwright install-deps             # Linux only, if system libraries are missing
+```
+
+From Python:
+
+```python
+from deja_browser.browser import wb
+wb("navigate", {"url": "https://example.com"}, session="task")
+wb("snapshot", {"max_chars": 4000}, session="task")
+wb("close_session", {}, session="task")
+```
+
+`deja-cdp --help` lists every action and its return shape.
+
 ## Safety model
 
 What protects you is **separation**: the agent profile is never logged in to mail, banking or
@@ -95,65 +155,15 @@ low-risk sites by itself, give it a dedicated vault through the password manager
 (`[secrets] backend = "command"`, see `config.example.toml`). 1Password service accounts can be
 limited to one vault; an unlocked Bitwarden CLI can read the whole vault.
 
+No telemetry: `tests/egress/run.sh` runs every action and a full recipe cycle inside a network
+namespace with only loopback, traces every `connect()` of the tool's processes, and fails on
+anything that is not `127.0.0.1` (its `SELFTEST=1` mode proves the check catches a deliberate
+connection). The only outbound features are ones you switch on: ntfy notifications and the opt-in
+hCaptcha solver.
+
 Two things no tool can change: the browser vendor's own services (e.g. Safe Browsing / SmartScreen
 URL checks) still apply to the agent profile, and whatever page content your agent reads goes to
 its model provider. Keep sensitive pages (health records, personal data) out of agent sessions.
-
-## Install
-
-Requires Python ≥ 3.11 and a Chromium-based browser.
-
-```sh
-pip install "deja-browser[stealth,keyring]"   # recommended: patchright driver + OS keyring secrets
-pip install "deja-browser[audio,ocr]"         # reCAPTCHA audio (faster-whisper), text CAPTCHAs (ddddocr)
-pip install -e ".[dev]"                       # from a clone: core + pytest
-python -m playwright install-deps  # Linux only, if system libraries are missing
-```
-
-`deja-browser` uses your installed browser; it does not need `playwright install`.
-
-## Quick start
-
-```sh
-deja-cdp launch                    # start the dedicated browser; log in to sites by hand if needed
-deja-cdp navigate '{"url": "https://example.com"}' --session demo
-deja-cdp evaluate '{"code": "document.title"}' --session demo
-deja-cdp close_session '{}' --session demo
-
-deja-browser verify draft.json '{"q": "rust"}'   # try every tier, print shape + preview
-deja-browser save draft.json                     # only after a passing verify of this draft
-deja-browser run hn.algolia.com/search '{"q": "rust"}'
-deja-browser list
-deja-browser gate https://example.com/login      # open a URL, clear any challenge, report
-```
-
-From Python:
-
-```python
-from deja_browser.browser import wb
-wb("navigate", {"url": "https://example.com"}, session="task")
-wb("snapshot", {"max_chars": 4000}, session="task")
-wb("close_session", {}, session="task")
-```
-
-`deja-cdp --help` and `deja-browser --help` list every action and the full recipe format.
-
-## Recipe format (abridged)
-
-```json
-{
-  "version": 1,
-  "name": "search",
-  "description": "Hacker News full-text search (example)",
-  "entry_url": "https://hn.algolia.com/",
-  "params": [{"name": "q", "required": true}],
-  "request": {"method": "GET", "url": "https://hn.algolia.com/api/v1/search?query={q}"},
-  "pick": {"path": "hits", "fields": ["title", "url"], "limit": 20},
-  "writes": false
-}
-```
-
-No recipes ship with the package — you (or your agent) build them per site. Recipes are stored as `<recipes dir>/<host>/<name>.json` and addressed as `<host>/<name>`.
 
 ## Configuration
 
@@ -166,8 +176,8 @@ Optional. Copy `config.example.toml` to:
 | Linux | `~/.config/deja-browser/config.toml` |
 
 or point `DEJA_BROWSER_CONFIG` at a file. It covers the browser executable and profile, the
-recipes directory, extra denied hosts, the secret backend (`keyring` / `env` / `python`), and
-notifications (an ntfy URL or any command; default is stderr).
+recipes directory, extra denied hosts, the secret backend (`keyring` / `command` / `env` /
+`python`), and notifications (an ntfy URL or any command; default is stderr).
 
 ## hCaptcha solver (opt-in, cloud)
 
@@ -210,5 +220,6 @@ sudo PY=$(which python) SELFTEST=1 tests/egress/run.sh # must FAIL: proves the c
 
 ## License
 
-MIT — see `LICENSE`. Optional dependencies keep their own licenses; GPL-licensed packages are
-never vendored into this repository.
+MIT — see [`LICENSE`](https://github.com/drpwchen/deja-browser/blob/main/LICENSE). Optional
+dependencies keep their own licenses; GPL-licensed packages are never vendored into this
+repository.

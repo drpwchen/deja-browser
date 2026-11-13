@@ -6,8 +6,8 @@ Config file: <config dir>/config.toml  (see config.example.toml in the repo). Ev
   macOS    ~/Library/Application Support/deja-browser  (config and data)
   Linux    $XDG_CONFIG_HOME/deja-browser       data: $XDG_DATA_HOME/deja-browser
 Overrides: DEJA_BROWSER_CONFIG (path of the config file), DEJA_BROWSER_HOME (data dir).
-Before 0.1.1 the tool was called edge-recipes: if the new file / dir does not exist the old one is
-used, and EDGE_RECIPES_* env vars are read when the DEJA_BROWSER_* one is unset.
+0.1.0 compatibility: if the new file / dir does not exist the LEGACY_APP one is used, and the
+legacy env var prefix is read when the DEJA_BROWSER_* one is unset (see env()).
 Paths in the file may use ~ and environment variables.
 """
 import os
@@ -16,11 +16,11 @@ import tomllib
 from pathlib import Path
 
 APP = "deja-browser"
-LEGACY_APP = "edge-recipes"   # name until 0.1.0; its dirs and EDGE_RECIPES_* env vars still work
+LEGACY_APP = "edge-recipes"   # 0.1.0 dir name; still read as a fallback
 
 
 def env(name):
-    """DEJA_BROWSER_<name>, else the 0.1.0 spelling EDGE_RECIPES_<name>, else None."""
+    """DEJA_BROWSER_<name>, else the 0.1.0 spelling of the same variable, else None."""
     return os.environ.get("DEJA_BROWSER_" + name) or os.environ.get("EDGE_RECIPES_" + name) or None
 
 

@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-11-14
+
+### Changed
+- README rewritten for a first-time visitor: one-line pitch, badges, the demo GIF, four key points,
+  a Quick start, a worked first recipe, and a comparison with browser-extension bridges. Detail
+  sections follow, tightened; all links are absolute so the PyPI page renders them.
+
 ## [0.1.2] — 2026-11-14
 
 ### Added
@@ -16,12 +23,10 @@ All notable changes to this project are documented here. The format follows
 ## [0.1.1] — 2026-11-14
 
 ### Changed
-- **Renamed to deja-browser** (was edge-recipes): distribution `deja-browser`, import
-  `deja_browser`, commands `deja-cdp` (was `edge-cdp`) and `deja-browser` (was `edge-recipes`),
-  config/data dirs `deja-browser`, env vars `DEJA_BROWSER_*`, skill folder `skills/deja-browser/`.
-  The old names keep working: an existing `edge-recipes` config or data dir is used when the new
-  one does not exist, `EDGE_RECIPES_*` env vars are read when the new one is unset, and the
-  default keyring service / env secret prefix fall back to `edge-recipes` / `EDGE_RECIPES_SECRET_`.
+- **Final names**: distribution `deja-browser`, import `deja_browser`, commands `deja-cdp` and
+  `deja-browser`, config/data dirs `deja-browser`, env vars `DEJA_BROWSER_*`, skill folder
+  `skills/deja-browser/`. Config and data dirs, env vars and stored secrets from 0.1.0 keep
+  working.
 
 ### Added
 - Published on PyPI: `pip install deja-browser` (releases are uploaded by GitHub Actions
@@ -55,9 +60,9 @@ All notable changes to this project are documented here. The format follows
 First public release.
 
 ### Added
-- `edge-cdp`: drive a dedicated Chromium profile (Edge, Chrome, Chromium, Brave; auto-detected)
+- Browser driver: a dedicated Chromium profile (Edge, Chrome, Chromium, Brave; auto-detected)
   over CDP on `127.0.0.1`, with named sessions that close only their own tabs.
-- `edge-recipes`: learn-once / replay recipes with an `http` → `page` → `script` tier ladder,
+- Site recipes: learn-once / replay with an `http` → `page` → `script` tier ladder,
   JSON shape checks (stale responses are reported, never returned), `verify`-before-`save`,
   and a `--allow-write` guard for recipes with side effects.
 - CAPTCHA gate: wait → trusted checkbox click → reCAPTCHA audio via local `faster-whisper` →

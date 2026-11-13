@@ -3,12 +3,29 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "edge-recipes"
-version = "0.1.0"
-description = "Learn a site's data path once in a real browser, replay it later without reading the page."
+name = "deja-browser"
+version = "0.1.1"
+description = "The agent browser that remembers: a separate Chromium profile your AI agent drives over CDP, with site recipes so the second visit skips reading the page."
+readme = "README.md"
+keywords = ["browser-automation", "cdp", "ai-agent", "claude-code", "playwright", "captcha"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+]
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = ["playwright>=1.45"]
+
+[project.urls]
+Homepage = "https://github.com/drpwchen/deja-browser"
+Changelog = "https://github.com/drpwchen/deja-browser/blob/main/CHANGELOG.md"
+Issues = "https://github.com/drpwchen/deja-browser/issues"
 
 [project.optional-dependencies]
 stealth = ["patchright"]          # default driver when installed (hides Runtime.enable)
@@ -21,8 +38,8 @@ ocr = ["ddddocr"]                 # text-image CAPTCHAs
 dev = ["pytest"]
 
 [project.scripts]
-edge-recipes = "edge_recipes.recipe:main"
-edge-cdp = "edge_recipes.browser:main"
+deja-browser = "deja_browser.recipe:main"
+deja-cdp = "deja_browser.browser:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

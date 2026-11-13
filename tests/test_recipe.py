@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from edge_recipes import recipe as sr
+from deja_browser import recipe as sr
 
 
 class SignatureTest(unittest.TestCase):
@@ -83,14 +83,14 @@ class GuardTest(unittest.TestCase):
 
 class HcaptchaSolverTest(unittest.TestCase):
     def test_off_by_default(self):
-        from edge_recipes import hcaptcha
+        from deja_browser import hcaptcha
         from unittest import mock
         with mock.patch.object(hcaptcha.config, "get", side_effect=lambda s, k, d=None: d):
             self.assertFalse(hcaptcha.enabled())
             self.assertEqual(hcaptcha.solve(object()), {"ran": False, "error": "disabled"})
 
     def test_opt_in_without_package_does_not_click(self):
-        from edge_recipes import hcaptcha
+        from deja_browser import hcaptcha
         from unittest import mock
         cfg = {("captcha", "hcaptcha_solver"): "gemini"}
         with mock.patch.object(hcaptcha.config, "get", side_effect=lambda s, k, d=None: cfg.get((s, k), d)), \

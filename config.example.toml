@@ -1,18 +1,27 @@
-# edge-recipes config — copy to:
-#   Windows  %APPDATA%\edge-recipes\config.toml
-#   macOS    ~/Library/Application Support/edge-recipes/config.toml
-#   Linux    ~/.config/edge-recipes/config.toml
-# (or point EDGE_RECIPES_CONFIG at it). Every key is optional; ~ and $VARS are expanded.
+# deja-browser config — copy to:
+#   Windows  %APPDATA%\deja-browser\config.toml
+#   macOS    ~/Library/Application Support/deja-browser/config.toml
+#   Linux    ~/.config/deja-browser/config.toml
+# (or point DEJA_BROWSER_CONFIG at it). Every key is optional; ~ and $VARS are expanded.
 
 [browser]
 # executable = "C:/Program Files/Google/Chrome/Application/chrome.exe"   # default: first of Edge/Chrome/Chromium/Brave
-# profile = "~/.edge-recipes-profile"     # dedicated user-data-dir; default <data dir>/profile
-# sessions_file = "~/.edge-recipes-sessions.json"
+# profile = "~/.deja-browser-profile"     # dedicated user-data-dir; default <data dir>/profile
+# sessions_file = "~/.deja-browser-sessions.json"
 # port = 9222                             # CDP, always bound to 127.0.0.1
+# check_profile = true                   # refuse a browser already on `port` that runs another profile
+#                                         # (checked once per browser start; later connects are free)
+# password_manager = false               # default: on every launch, turn OFF the profile's password,
+#                                         # card and address autofill. true = leave them alone (e.g. the
+#                                         # profile is signed in to browser sync and you do not want the
+#                                         # change to sync to your other browsers).
 
 [recipes]
-# dir = "~/edge-recipes"                  # default <data dir>/recipes
-# deny_hosts_extra = ["mybank", "mybroker"]   # added to the built-in mail/bank/broker refusals
+# dir = "~/deja-browser"                  # default <data dir>/recipes
+# deny_hosts_extra = ["mybank", "mybroker"]   # added to the built-in refusals (mail, account sign-in,
+#                                         # banks, brokers, payments). Substring of the host. Guard rail,
+#                                         # not a lock: `navigate` and recipes refuse, page scripts can
+#                                         # still redirect.
 # allow_ticket_hosts = []                 # ticketing / rail booking hosts are refused by default
 #                                         # (anti-scalping laws). Lift one ("railway.gov.tw") or all
 #                                         # ("*") at your own risk — not recommended.
@@ -27,11 +36,16 @@
 # solver_timeout = 180                    # seconds per challenge
 
 [secrets]
-# backend = "keyring"                     # keyring (default) | env | python
-# service = "edge-recipes"                # keyring service name
-# env_prefix = "EDGE_RECIPES_SECRET_"     # backend = "env"
+# backend = "keyring"                     # keyring (default) | command | env | python
+# command = ["op", "read", "op://agent/{name}/password"]    # backend = "command": stdout = value,
+#                                         # non-zero exit = missing; no shell. Other examples:
+#                                         #   ["bw", "get", "password", "{name}"]   (needs BW_SESSION)
+#                                         #   ["security", "find-generic-password", "-w", "-s", "{name}"]
+#                                         #   ["pass", "show", "agent/{name}"]
+# service = "deja-browser"                # keyring service name
+# env_prefix = "DEJA_BROWSER_SECRET_"     # backend = "env"
 # python = "~/my_store.py:get_secret"     # backend = "python": function(name) -> str | None
-# set_hint = "keyring set edge-recipes {name}"   # shown when a secret is missing
+# set_hint = "keyring set deja-browser {name}"   # shown when a secret is missing
 
 [notify]
 # ntfy = "https://ntfy.sh/your-private-topic"

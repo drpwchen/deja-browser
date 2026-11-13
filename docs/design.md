@@ -1,4 +1,4 @@
-# edge-recipes — design
+# deja-browser — design
 
 **Goal:** an agent learns a website's data path once; later runs replay it without anyone (LLM or
 human) reading the page. When a CAPTCHA is in the way, the tool tries to clear it itself; a
@@ -8,11 +8,12 @@ human is the last resort. It runs on anyone's machine, not just the author's.
 
 | Module | Role |
 |---|---|
-| `browser.py` | Starts / attaches to a Chromium browser over CDP on `127.0.0.1`, dedicated user-data dir. Named sessions own the tabs they open; `close_session` closes only those. CLI `edge-cdp`. |
-| `recipe.py` | Recipe store, the tier ladder (`http` → `page` → `script`), shape checks, login gate, CAPTCHA gate. CLI `edge-recipes`. |
+| `browser.py` | Starts / attaches to a Chromium browser over CDP on `127.0.0.1`, dedicated user-data dir. Named sessions own the tabs they open; `close_session` closes only those. CLI `deja-cdp`. |
+| `recipe.py` | Recipe store, the tier ladder (`http` → `page` → `script`), shape checks, login gate, CAPTCHA gate. CLI `deja-browser`. |
 | `hcaptcha.py` | Optional hCaptcha image/drag solver (cloud, opt-in). |
 | `config.py` | Reads `config.toml` from the OS config dir. Stdlib only. |
-| `secretstore.py` | Secret backends: OS keyring (default), environment, or your own Python function. |
+| `guard.py` | Guard rails: refused hosts (shared by `navigate` and recipes), turning off the profile's own password / card / address autofill on launch, warning about password-manager extensions in the profile. Not a security boundary — separation is. |
+| `secretstore.py` | Secret backends: OS keyring (default), a command (password-manager CLIs), environment, or your own Python function. |
 | `notify.py` | "A human is needed" notifications: ntfy URL, any command, or stderr. |
 
 ## Recipes

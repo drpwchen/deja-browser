@@ -31,6 +31,6 @@ def notify(title, message):
                     for a in cmd]
             subprocess.run(argv, timeout=20, capture_output=True)
         else:
-            print(f"[edge-recipes] {title}: {message}", file=sys.stderr)
+            print(f"[deja-browser] {title}: {message}", file=sys.stderr)
     except Exception:
         pass

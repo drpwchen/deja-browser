@@ -51,32 +51,16 @@ from pathlib import Path
 if importlib.util.find_spec("patchright"):
     os.environ.setdefault("EDGE_CDP_DRIVER", "patchright")
 from . import browser as edge_cdp  # noqa: E402
-from . import config, hcaptcha, notify, secretstore  # noqa: E402
+from . import config, guard, hcaptcha, notify, secretstore  # noqa: E402
 # patchright by default (2026-11-11 live test): with plain playwright the Cloudflare full-page
 # interstitial re-rendered its checkbox after the click (= rejected, Runtime.enable CDP signal);
 # patchright passed it on the first click. A recipe may still say "driver": "playwright".
 
 RECIPES = config.path("recipes", "dir", config.data_dir() / "recipes")
 MAX_OUT = 20000
-# the agent profile is never logged in to these: refuse recipes for them (substring of the host).
-# [recipes] deny_hosts_extra adds local names (e.g. your own banks).
-DENY_HOSTS = ("mail.google.", "gmail.", "outlook.live.", "bank", "securities", "paypal.",
-              *config.get("recipes", "deny_hosts_extra", []))
-# ticketing / rail booking: automated purchase is anti-scalping territory (e.g. Taiwan Railway
-# Act art. 65, event-ticket laws), so these are refused by default. [recipes] allow_ticket_hosts
-# lifts entries ("railway.gov.tw", or "*" for all) — your call, your liability; not recommended.
-TICKET_HOSTS_DEFAULT = ("ticketmaster.", "livenation.", "stubhub.", "viagogo.", "seetickets.", "axs.com",
-                        "tixcraft.", "kktix.", "ibon.com.tw", "ticket.com.tw", "eplus.jp", "pia.jp",
-                        "l-tike.", "interpark.", "yes24.", "melon.com", "damai.cn", "12306.cn",
-                        "railway.gov.tw", "thsrc.com.tw", "eki-net.", "smart-ex.jp", "irctc.")
-
-
-def _ticket_hosts(allow):
-    allow = set(allow or ())
-    return () if "*" in allow else tuple(d for d in TICKET_HOSTS_DEFAULT if d not in allow)
-
-
-TICKET_HOSTS = _ticket_hosts(config.get("recipes", "allow_ticket_hosts", []))
+# deny / ticket host lists live in guard.py (shared with the browser layer)
+DENY_HOSTS, TICKET_HOSTS, TICKET_HOSTS_DEFAULT = guard.DENY_HOSTS, guard.TICKET_HOSTS, guard.TICKET_HOSTS_DEFAULT
+_ticket_hosts = guard.ticket_hosts
 
 
 class RecipeError(RuntimeError):
@@ -94,12 +78,10 @@ def _host(url):
 
 
 def _check_host(url):
-    h = _host(url)
-    if any(d in h for d in DENY_HOSTS):
-        raise RecipeError(f"{h}: banks / brokers / mail are off-limits for the agent profile")
-    if any(d in h for d in TICKET_HOSTS):
-        raise RecipeError(f"{h}: ticketing / rail booking sites are refused by default (anti-scalping "
-                          "laws); see [recipes] allow_ticket_hosts")
+    try:
+        guard.check_host(url)
+    except guard.HostRefused as ex:
+        raise RecipeError(str(ex)) from None
 
 
 def _secret(name):
@@ -492,6 +474,7 @@ def login_gate(page, login):
     if login.get("url"):
         page.goto(login["url"], wait_until="domcontentloaded", timeout=45000)
     challenge_gate(page)
+    _check_host(page.url)   # wherever the login page redirected to, secrets never go to a denied host
     page.fill(login["user_selector"], _secret(login["user_secret"]), timeout=10000)
     page.fill(login["pass_selector"], _secret(login["pass_secret"]), timeout=10000)
     page.locator(login["submit_selector"]).first.click(timeout=10000)
@@ -592,6 +575,8 @@ def run(recipe, given, tier=None, allow_write=False, session=None, check_sig=Tru
     if recipe.get("writes") and not allow_write:
         raise RecipeError("this recipe has side effects — pass --allow-write")
     args = _args(recipe, given)
+    if recipe.get("request"):   # the API host can differ from entry_url; it gets cookies and secrets
+        _check_host(_render(recipe["request"].get("url", ""), args, secrets_ok=False))
     session = session or f"recipe-{_host(recipe['entry_url'])}"
     want = (recipe.get("expect") or {}).get("signature")
     tried = []

@@ -3,7 +3,7 @@
 
   Dedicated profile ([browser] profile, default <data dir>/profile), CDP on 127.0.0.1:9222 only.
   Never touches the user's everyday browser profile. Any Chromium browser works: [browser]
-  executable / env EDGE_RECIPES_BROWSER, else the first of Edge, Chrome, Chromium, Brave found on
+  executable / env DEJA_BROWSER_BROWSER, else the first of Edge, Chrome, Chromium, Brave found on
   this machine. Started on demand and left running afterwards — close_session only closes this
   session's tabs.
 
@@ -45,7 +45,7 @@ CLI:
 import atexit, json, os, shutil, signal, subprocess, sys, tempfile, time, urllib.request
 from pathlib import Path
 
-from . import config
+from . import config, guard
 
 
 def _candidates():
@@ -63,8 +63,8 @@ def _candidates():
 
 
 def find_browser():
-    """[browser] executable > env EDGE_RECIPES_BROWSER > first installed candidate > None."""
-    want = config.get("browser", "executable") or os.environ.get("EDGE_RECIPES_BROWSER")
+    """[browser] executable > env DEJA_BROWSER_BROWSER > first installed candidate > None."""
+    want = config.get("browser", "executable") or config.env("BROWSER")
     if want:
         return str(config.expand(want))
     return next((c for c in _candidates() if os.path.exists(c)), None)
@@ -75,7 +75,7 @@ PROFILE = config.path("browser", "profile", config.data_dir() / "profile")
 SESSIONS_FILE = config.path("browser", "sessions_file", config.data_dir() / "sessions.json")
 PORT = int(config.get("browser", "port", 9222))
 ENDPOINT = f"http://127.0.0.1:{PORT}"
-SHOT_DIR = Path(tempfile.gettempdir()) / "edge-cdp"
+SHOT_DIR = Path(tempfile.gettempdir()) / "deja-cdp"
 
 
 def launch_args():
@@ -101,15 +101,80 @@ def version():
         return None
 
 
+ID_FILE = ".deja-cdp-browser"   # in PROFILE: id of the live browser last confirmed to run on this profile
+
+
+def _browser_id(v):
+    """The per-process GUID in /json/version's webSocketDebuggerUrl; changes on every browser start."""
+    return ((v or {}).get("webSocketDebuggerUrl") or "").rstrip("/").rsplit("/", 1)[-1]
+
+
+def _remember(bid):
+    if bid:
+        try:
+            (PROFILE / ID_FILE).write_text(bid, encoding="utf-8")
+        except OSError:
+            pass
+
+
+def _user_data_dir(cmdline):
+    """--user-data-dir from a process command line (quoted or not, spaces allowed) -> str | None."""
+    i = cmdline.find("--user-data-dir=")
+    if i < 0:
+        return None
+    rest = cmdline[i + len("--user-data-dir="):]
+    if rest.startswith('"'):
+        rest = rest[1:].split('"', 1)[0]
+    else:
+        rest = rest.split(" --", 1)[0].split('" ', 1)[0]
+    return rest.strip().strip('"') or None
+
+
+def _same_dir(a, b):
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def check_profile(v):
+    """Refuse a browser on PORT that is not running PROFILE (e.g. another tool's, or one started with a
+    config that could not be read). Fast path: its id matches the one recorded in PROFILE — a string
+    compare, no process lookup. Only a browser we have not seen yet costs the netstat + command-line
+    query, once; then its id is recorded. [browser] check_profile = false turns this off."""
+    bid = _browser_id(v)
+    try:
+        if bid and (PROFILE / ID_FILE).read_text(encoding="utf-8").strip() == bid:
+            return
+    except OSError:
+        pass
+    if not config.get("browser", "check_profile", True):
+        return
+    pid = listener_pid()
+    other = _user_data_dir(_cmdline(pid)) if pid else None
+    if other is None:
+        return   # cannot tell (no permission, unusual platform): do not block, do not record
+    if not _same_dir(other, PROFILE):
+        raise WbError(f"port {PORT} is held by a browser on another profile ({other}), not the agent "
+                      f"profile {PROFILE}. Close that browser, or use another [browser] port.")
+    _remember(bid)
+
+
 def launch(timeout=20, url="about:blank"):
     """Start headed Edge on the agent profile unless CDP is already up. -> (version_json, launched_by_us)."""
     v = version()
     if v:
+        check_profile(v)
         return v, False
     if not EDGE or not os.path.exists(EDGE):
         raise WbError(f"no Chromium browser found ({EDGE or 'none detected'}); "
                       f"set [browser] executable in {config.config_path()}")
     PROFILE.mkdir(parents=True, exist_ok=True)
+    guard.harden_profile(PROFILE)   # browser is down: safe to edit Preferences
+    for eid, name in guard.password_managers(PROFILE):
+        print(f"deja-cdp: warning: password manager extension {name!r} ({eid}) is installed in the agent "
+              "profile; while unlocked it can fill any saved password for the agent. Remove it, or keep it "
+              "logged out.", file=sys.stderr)
     # detached: the browser must outlive the script that woke it
     flags = 0x00000008 | 0x00000200 if os.name == "nt" else 0
     subprocess.Popen([EDGE, *launch_args(), url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -118,6 +183,7 @@ def launch(timeout=20, url="about:blank"):
     while time.time() < deadline:
         v = version()
         if v:
+            _remember(_browser_id(v))   # we started it on PROFILE: no lookup needed later
             return v, True
         time.sleep(0.5)
     raise WbError(f"CDP endpoint {ENDPOINT} not up after {timeout}s")
@@ -293,10 +359,20 @@ def _tab_info(t, p, cur=None):
 
 # ---------- actions ----------
 
+def _guard(url):
+    """Refuse mail / sign-in / bank / broker hosts (guard.py). A guard rail against accidents, not a
+    lock: the lock is that the agent profile is never logged in to them."""
+    try:
+        guard.check_host(url, tickets=False)
+    except guard.HostRefused as ex:
+        raise WbError(str(ex)) from None
+
+
 def _navigate(ctx, session, a):
     url = a.get("url")
     if not url:
         raise WbError("navigate: url required")
+    _guard(url)
     m, e, pages = _session_pages(ctx, session)
     page = None
     if not a.get("newTab"):
@@ -499,6 +575,7 @@ def _network_capture(page, a):
             raise WbError('network_capture: trigger must be an object, e.g. {"navigate": url} | '
                           '{"reload": true} | {"click": selector} | {"evaluate": js}')
         if trig.get("navigate"):
+            _guard(trig["navigate"])
             page.goto(trig["navigate"], wait_until="domcontentloaded", timeout=a.get("timeout", 45000))
         elif trig.get("reload"):
             page.reload(wait_until="domcontentloaded", timeout=a.get("timeout", 45000))
@@ -630,7 +707,7 @@ def main(argv=None):
         out = stop()
     else:
         if len(argv) > 2:
-            raise SystemExit(f"edge-cdp: unexpected arguments {argv[2:]} (usage: <action> '<json>' [--session S])")
+            raise SystemExit(f"deja-cdp: unexpected arguments {argv[2:]} (usage: <action> '<json>' [--session S])")
         out = wb(cmd, json.loads(argv[1]) if len(argv) > 1 else {}, session=session)
     print(json.dumps(out, ensure_ascii=False))
     return 0

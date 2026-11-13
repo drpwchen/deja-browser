@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from edge_recipes import browser as ec
+from deja_browser import browser as ec
 
 
 class FakeLocator:
@@ -258,15 +258,20 @@ class EdgeCdpTest(unittest.TestCase):
 class LaunchTest(unittest.TestCase):
     def test_launch_noop_when_cdp_up(self):
         with mock.patch.object(ec, "version", return_value={"Browser": "Edg/156"}), \
+             mock.patch.object(ec, "check_profile") as chk, \
              mock.patch.object(ec.subprocess, "Popen") as popen:
             self.assertEqual(ec.launch(), ({"Browser": "Edg/156"}, False))
             popen.assert_not_called()
+            chk.assert_called_once_with({"Browser": "Edg/156"})
 
     def test_launch_starts_dedicated_profile_on_loopback(self):
         seq = iter([None, None, {"Browser": "Edg/156"}])
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(ec, "version", side_effect=lambda: next(seq)), \
              mock.patch.object(ec, "PROFILE", Path(td) / "agent-profile"), \
+             mock.patch.object(ec, "EDGE", "/fake/browser"), \
+             mock.patch.object(ec.guard, "harden_profile"), \
+             mock.patch.object(ec.guard, "password_managers", return_value=[]), \
              mock.patch.object(ec.os.path, "exists", return_value=True), \
              mock.patch.object(ec.time, "sleep"), \
              mock.patch.object(ec.subprocess, "Popen") as popen:
@@ -308,6 +313,63 @@ class EdgeHelpersTest(unittest.TestCase):
         self.assertTrue(h["Cookie"].startswith("<redacted"))
         self.assertTrue(h["X-CSRF-Token"].startswith("<redacted"))
         self.assertEqual(h["content-type"], "application/json")
+
+
+class ProfileCheckTest(unittest.TestCase):
+    """launch() must not hand out a browser on PORT that runs another profile; the check is free
+    once the browser's id is recorded in the profile dir."""
+    V = {"webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/browser/aaaa-1111"}
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.prof = Path(self.td.name) / "profile"
+        self.prof.mkdir()
+        self.p = mock.patch.object(ec, "PROFILE", self.prof)
+        self.p.start()
+
+    def tearDown(self):
+        self.p.stop()
+        self.td.cleanup()
+
+    def test_recorded_id_is_a_string_compare_only(self):
+        (self.prof / ec.ID_FILE).write_text("aaaa-1111", encoding="utf-8")
+        with mock.patch.object(ec, "listener_pid", side_effect=AssertionError("no lookup")):
+            ec.check_profile(self.V)
+
+    def test_unseen_browser_on_our_profile_is_recorded(self):
+        cl = f'"msedge.exe" --user-data-dir={self.prof} --remote-debugging-port=9222'
+        with mock.patch.object(ec, "listener_pid", return_value=42),                 mock.patch.object(ec, "_cmdline", return_value=cl) as cmd:
+            ec.check_profile(self.V)
+            self.assertEqual((self.prof / ec.ID_FILE).read_text(encoding="utf-8"), "aaaa-1111")
+            ec.check_profile(self.V)          # second time: fast path
+            self.assertEqual(cmd.call_count, 1)
+
+    def test_browser_on_another_profile_is_refused(self):
+        (self.prof / ec.ID_FILE).write_text("old-id", encoding="utf-8")
+        cl = f'msedge.exe --user-data-dir={Path(self.td.name) / "other"} --remote-debugging-port=9222'
+        with mock.patch.object(ec, "listener_pid", return_value=42),                 mock.patch.object(ec, "_cmdline", return_value=cl):
+            with self.assertRaises(ec.WbError) as cm:
+                ec.check_profile(self.V)
+            self.assertIn("another profile", str(cm.exception))
+        self.assertEqual((self.prof / ec.ID_FILE).read_text(encoding="utf-8"), "old-id")
+
+    def test_unknown_listener_is_allowed_but_not_recorded(self):
+        with mock.patch.object(ec, "listener_pid", return_value=42),                 mock.patch.object(ec, "_cmdline", return_value=""):
+            ec.check_profile(self.V)
+        self.assertFalse((self.prof / ec.ID_FILE).exists())
+
+    def test_check_can_be_turned_off(self):
+        with mock.patch.object(ec.config, "CONFIG", {"browser": {"check_profile": False}}),                 mock.patch.object(ec, "listener_pid", side_effect=AssertionError("no lookup")):
+            ec.check_profile(self.V)
+
+    def test_user_data_dir_parsing(self):
+        f = ec._user_data_dir
+        self.assertEqual(f(r"edge --user-data-dir=C:\x\p --remote-debugging-port=9222"), r"C:\x\p")
+        self.assertEqual(f(r'"edge.exe" "--user-data-dir=C:\a b\p" --remote-debugging-port=1'), r"C:\a b\p")
+        self.assertEqual(f(r'edge --user-data-dir="C:\a b\p" --x'), r"C:\a b\p")
+        self.assertEqual(f("chrome --user-data-dir=/Users/u/Library/Application Support/d/profile --remote-debugging-port=9222"),
+                         "/Users/u/Library/Application Support/d/profile")
+        self.assertIsNone(f("edge --remote-debugging-port=9222"))
 
 
 if __name__ == "__main__":

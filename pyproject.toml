@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deja-browser"
-version = "0.1.1"
+version = "0.1.2"
 description = "The agent browser that remembers: a separate Chromium profile your AI agent drives over CDP, with site recipes so the second visit skips reading the page."
 readme = "README.md"
 keywords = ["browser-automation", "cdp", "ai-agent", "claude-code", "playwright", "captcha"]

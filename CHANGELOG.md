@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-11-14
+
+### Added
+- Demo GIF at the top of the README: the same Hacker News search as a first visit (navigate +
+  snapshot, 29,427 characters of page tree) and as a recipe replay (588 characters of JSON, no page
+  opened). Numbers come from a real run.
+
 ## [0.1.1] — 2026-11-14
 
 ### Changed

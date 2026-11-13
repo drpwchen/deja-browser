@@ -2,6 +2,10 @@
 
 *The agent browser that remembers.* (Formerly edge-recipes.)
 
+![The same Hacker News search twice: the first visit reads a 29,427-character page tree, the recipe replay returns 588 characters of JSON without opening the page](https://raw.githubusercontent.com/drpwchen/deja-browser/main/docs/demo.gif)
+
+*Rendered from a real run against hn.algolia.com; wall times are the median of 3 runs.*
+
 **A browser for your AI agent that is not your browser.** A separate Chromium profile your agent
 drives over CDP — with no telemetry, no extension in your everyday browser, and site *recipes*
 so the second visit to a site does not need to read the page at all.

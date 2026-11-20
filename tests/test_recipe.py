@@ -179,3 +179,150 @@ class LateWidgetTest(unittest.TestCase):
             g = sr.challenge_gate(page, human_wait=0)
         wait.assert_not_called()
         self.assertEqual(g["how"], "none")
+
+
+def _items(n):
+    return [{"title": f"Story {i} " + "x" * 80, "url": f"https://example.org/{i}", "points": i} for i in range(n)]
+
+
+class RunLimitTest(unittest.TestCase):
+    def test_pick_limit_only_lowers(self):
+        data = {"hits": [{"t": i} for i in range(10)]}
+        spec = {"path": "hits", "limit": 5}
+        self.assertEqual(len(sr.pick(data, spec, 2)), 2)
+        self.assertEqual(len(sr.pick(data, spec, 99)), 5)       # cannot raise the saved limit
+        self.assertEqual(len(sr.pick(data, spec)), 5)
+        self.assertEqual(len(sr.pick({"hits": [{"t": i} for i in range(80)]}, {"path": "hits"}, 99)), 50)
+        self.assertEqual(len(sr.pick([1, 2, 3, 4], None, 2)), 2)   # a recipe with no pick spec
+        self.assertEqual(len(sr.pick(list(range(80)), None, 70)), 70)   # ... is not capped at the default 50
+
+    def test_take_limit(self):
+        self.assertEqual(sr._take_limit({"q": "x", "_limit": "3"}), ({"q": "x"}, 3))
+        self.assertEqual(sr._take_limit({"q": "x"}), ({"q": "x"}, None))
+        self.assertEqual(sr._take_limit({"_limit": 0})[1], 0)
+        for bad in ("abc", -1, 2.5, True, "2.5", [1], "-1"):
+            with self.assertRaises(sr.RecipeError):
+                sr._take_limit({"_limit": bad})
+
+    def _stored(self, d):
+        store = Path(d) / "store"
+        (store / "example.org").mkdir(parents=True)
+        rec = {"name": "t1", "entry_url": "https://example.org/", "request": {"url": "https://example.org/api"},
+               "tier": "http", "pick": {"path": "hits", "fields": ["title", "url", "points"], "limit": 20}}
+        (store / "example.org" / "t1.json").write_text(json.dumps(rec), encoding="utf-8")
+        return store
+
+    def test_run_limit_shrinks_output_to_a_sixth(self):
+        payload = {"hits": _items(60)}
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(sr, "RECIPES", self._stored(d)), \
+             mock.patch.dict(sr.TIERS, {"http": lambda *a: (200, payload)}):
+            full = sr.cmd_run("example.org/t1", {})
+            small = sr.cmd_run("example.org/t1", {"_limit": 3})
+        self.assertEqual((len(full["data"]), len(small["data"])), (20, 3))
+        n_full, n_small = (len(json.dumps(x, ensure_ascii=False)) for x in (full, small))
+        self.assertLess(n_small * 5, n_full)                       # ~1/6 of the replay output
+
+    def test_limit_is_not_a_template_param_or_signature_input(self):
+        rec = {"entry_url": "https://example.org/", "request": {"url": "https://example.org/api"},
+               "pick": {"path": "hits", "limit": 20}, "expect": {"signature": [{"title": "str"}]}}
+        seen = []
+        with mock.patch.dict(sr.TIERS, {"http": lambda r, a, s: (seen.append(a) or 200, {"hits": _items(5)})}):
+            self.assertTrue(sr.run(rec, sr._take_limit({"_limit": 1})[0])["ok"])
+        self.assertEqual(seen, [{}])
+
+
+class EnvelopeTest(unittest.TestCase):
+    def _run(self, tiers, **kw):
+        with tempfile.TemporaryDirectory() as d:
+            store = Path(d) / "store"
+            (store / "example.org").mkdir(parents=True)
+            rec = {"name": "t", "entry_url": "https://example.org/", "request": {"url": "https://example.org/a"},
+                   "tier": "http"}
+            (store / "example.org" / "t.json").write_text(json.dumps(rec), encoding="utf-8")
+            with mock.patch.object(sr, "RECIPES", store), mock.patch.dict(sr.TIERS, tiers):
+                return sr.cmd_run("example.org/t", {}, **kw)
+
+    def test_empty_tried_is_dropped_but_a_fallthrough_stays(self):
+        ok = self._run({"http": lambda *a: (200, {"a": 1})})
+        self.assertEqual(ok, {"ok": True, "tier": "http", "data": {"a": 1}})
+        fell = self._run({"http": lambda *a: (403, "no"), "page": lambda *a: (200, {"a": 1})})
+        self.assertEqual(fell["tried"], [{"tier": "http", "status": 403}])
+
+    def test_data_only_prints_just_the_data_and_failures_stay_full(self):
+        self.assertEqual(self._run({"http": lambda *a: (200, {"a": 1})}, data_only=True), {"a": 1})
+        bad = self._run({"http": lambda *a: (500, "x"), "page": lambda *a: (500, "x")}, data_only=True)
+        self.assertFalse(bad["ok"])
+        self.assertEqual(len(bad["tried"]), 2)
+
+    def test_cli_flags(self):
+        out = []
+        with mock.patch.object(sr, "cmd_run", return_value={"a": 1}) as m, \
+             mock.patch("builtins.print", side_effect=out.append):
+            rc = sr.main(["run", "example.org/t", '{"_limit": 2}', "--data-only"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(m.call_args.args, ("example.org/t", {"_limit": 2}, None, False, True))
+        self.assertEqual(json.loads(out[0]), {"a": 1})
+
+
+class VerifyOutputTest(unittest.TestCase):
+    def _verify(self, tiers, page_chars=None, pick=None):
+        draft = {"name": "t1", "description": "d", "entry_url": "https://example.org/", "script": "return 1",
+                 "request": {"url": "https://example.org/api"}}
+        if pick:
+            draft["pick"] = pick
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "t1.json"
+            p.write_text(json.dumps(draft), encoding="utf-8")
+            with mock.patch.dict(sr.TIERS, tiers), mock.patch.object(sr, "_page_chars", return_value=page_chars):
+                return sr.cmd_verify(str(p), {})
+
+    def test_same_shape_preview_printed_once_and_capped(self):
+        payload = {"hits": _items(60)}
+        pick = {"path": "hits", "fields": ["title", "url", "points"], "limit": 20}
+        same = lambda *a: (200, payload)  # noqa: E731
+        out = self._verify({"http": same, "page": same, "script": same}, pick=pick)
+        self.assertEqual(out["passed"], ["http", "page", "script"])
+        first, second, third = out["results"]
+        self.assertTrue(first["preview"]["truncated"])
+        self.assertLessEqual(len(first["preview"]["head"]), sr.PREVIEW_OUT)
+        self.assertEqual(second["preview"], "same shape as http")
+        self.assertEqual(third["preview"], "same shape as http")
+        self.assertLess(len(json.dumps(out, ensure_ascii=False)), 3000)      # was ~3 full previews
+        self.assertGreater(first["out_chars"], 2500)                         # real size still reported
+
+    def test_a_different_shape_still_gets_its_own_preview(self):
+        out = self._verify({"http": lambda *a: (200, {"a": 1}), "page": lambda *a: (200, {"b": "x"}),
+                            "script": lambda *a: (500, "no")})
+        self.assertEqual(out["results"][0]["preview"], {"a": 1})
+        self.assertEqual(out["results"][1]["preview"], {"b": "x"})
+        self.assertFalse(out["results"][2]["ok"])
+
+    def test_warns_when_output_is_not_much_smaller_than_the_page(self):
+        t5 = {"title": "Bot", "h1": "Bot", "text": "menu " * 60}               # ~330 chars of nav text
+        out = self._verify({"http": lambda *a: (200, t5)}, page_chars=500)
+        self.assertEqual(out["page_chars"], 500)
+        self.assertIn("not much smaller", out["warning"])
+        slim = self._verify({"http": lambda *a: (200, {"title": "Bot"})}, page_chars=500)
+        self.assertNotIn("warning", slim)
+        self.assertEqual(slim["page_chars"], 500)
+
+    def test_output_larger_than_the_page_warns(self):
+        out = self._verify({"http": lambda *a: (200, {"a": "x" * 900})}, page_chars=100)
+        self.assertIn("warning", out)
+
+    def test_no_page_measure_no_warning(self):
+        out = self._verify({"http": lambda *a: (200, {"a": "x" * 5000})}, page_chars=None)
+        self.assertNotIn("warning", out)
+        self.assertNotIn("page_chars", out)
+
+    def test_page_chars_skips_challenge_pages_and_errors(self):
+        page = mock.Mock()
+        page.evaluate.return_value = 1234
+        rec = {"entry_url": "https://example.org/"}
+        with mock.patch.object(sr, "_page_for", return_value=page), mock.patch.object(sr, "challenge", return_value=None):
+            self.assertEqual(sr._page_chars(rec, "s"), 1234)
+        with mock.patch.object(sr, "_page_for", return_value=page), mock.patch.object(sr, "challenge", return_value="turnstile"):
+            self.assertIsNone(sr._page_chars(rec, "s"))
+        with mock.patch.object(sr, "_page_for", side_effect=RuntimeError("no browser")):
+            self.assertIsNone(sr._page_chars(rec, "s"))

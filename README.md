@@ -47,7 +47,25 @@ the few choices that matter, has you log in to your sites by hand, and runs a sm
 
 ## Your first recipe
 
-Save this as `draft.json` (a minimal recipe for the site in the GIF, using its public JSON API):
+The usual way: capture the JSON request the site makes, and let `draft` write the recipe from it.
+The example is the site in the GIF (Hacker News search, through its public JSON API):
+
+```sh
+deja-cdp network_capture '{"trigger":{"navigate":"https://hn.algolia.com/api/v1/search?query=rust"},"url_filter":"api/v1/search","types":"all"}' --session hn-draft > capture.json
+deja-browser draft capture.json --expect Rust --param q=rust --out draft.json   # writes draft.json
+deja-browser verify draft.json '{"q": "rust"}'          # try every tier, print shape + preview
+deja-browser save draft.json                            # only after a passing verify of this draft
+deja-browser run hn.algolia.com/search '{"q": "rust"}'  # replay: titles + URLs, no page read
+```
+
+`--expect` is a string the answer must contain (at least 3 characters); `--param` is the value you
+used during the capture, so the draft turns it into `{q}`. The draft has `TODO` fields for
+`when_to_use` and the param description: fill them in before `save`. If the page's data is in the
+HTML rather than a JSON response, `draft` prints `"applicable": false` and exits with code 2 — then
+write a `script` recipe instead (a DOM read; `deja-cdp read` finds the text on the page).
+
+If you would rather write the recipe by hand, this is the same example (a minimal recipe for the
+site in the GIF, using its public JSON API):
 
 ```json
 {

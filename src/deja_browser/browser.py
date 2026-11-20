@@ -24,11 +24,25 @@ Actions (return shapes follow the Kimi `data` payload):
   list_browser_tabs                  {success, tabs:[...]}                            whole browser
   find_tab {url, active}             {success, url, tabId, borrowed}
   attach_tab {tabId}                 {success, tabId, url, title, borrowed}
-  snapshot {max_chars, selector, interactive_only, query}
-                                     {url, title, tree_text, chars, full_chars, truncated}
+  snapshot {max_chars=20000, selector, interactive_only, query, offset}
+                                     {url, title, tree_text, chars, full_chars, truncated,
+                                      next_offset?, hint?}   (cut on a line boundary; when truncated,
+                                      hint says how to narrow or page on with offset=next_offset)
+  read {selector="body", query, context_lines=2, max_chars=20000, offset}
+                                     {url, title, text, chars, full_chars, truncated, next_offset?, hint?}
+                                     innerText by lines; query keeps only matching lines + context ('…'
+                                     between gaps). On a big page try `read {query}` before snapshot.
   network_capture {trigger, url_filter, types, wait_ms, body_dir}
                                      {url, count, body_dir, requests:[{i, method, url, status, type, mime,
                                       req_headers (credentials redacted), post_data, body_path, body_bytes}]}
+                                     (trigger.navigate opens a tab if the session has none)
+  wait {text | selector | js, timeout=15000, state="visible"}
+                                     {success, waited_ms}     (a timeout is success:false, not an error)
+  batch {steps, stop_on_error=true}  {ok, results:[{action, ok, data | error, secs}]}
+                                     steps = [{action, args, quiet?}] run in ONE process / CDP connection
+                                     (saves the ~0.5 s driver start per call); no nested batch; a failed
+                                     step (an error, or a wait that timed out) skips the rest (skipped:true) unless stop_on_error is false;
+                                     quiet:true keeps only {ok, secs} for a successful step
   cdp {method, params}               raw CDP result
   close_session                      {success, closed}        (borrowed tabs are left open)
 
@@ -41,6 +55,9 @@ CLI:
   deja-cdp status                     is CDP up? which version?
   deja-cdp stop                       kill ONLY the agent-profile browser (refuses any other 9222 owner)
   deja-cdp <action> '<json args>' [--session S]
+  deja-cdp batch '{"steps":[{"action":"navigate","args":{"url":"https://example.com"},"quiet":true},
+                            {"action":"wait","args":{"text":"Example"}},
+                            {"action":"evaluate","args":{"code":"document.title"}}]}' --session S
 """
 import atexit, json, os, shutil, signal, subprocess, sys, tempfile, time, urllib.request
 from pathlib import Path
@@ -521,9 +538,72 @@ def _snapshot(page, a):
     if a.get("interactive_only"):
         lines = [ln for ln in lines if _role(ln) in _INTERACTIVE]
     text = "\n".join(lines)
-    n = int(a.get("max_chars") or 20000)
-    return {"url": page.url, "title": page.title(), "tree_text": text[:n],
-            "chars": len(text), "full_chars": full, "truncated": len(text) > n}
+    piece, nxt = _clip(text, a.get("max_chars"), a.get("offset"))
+    out = {"url": page.url, "title": page.title(), "tree_text": piece,
+           "chars": len(text), "full_chars": full, "truncated": nxt is not None}
+    if nxt is not None:
+        out["next_offset"] = nxt
+        out["hint"] = _trunc_hint(nxt, len(text), "snapshot")
+    return out
+
+
+def _clip(text, max_chars=None, offset=None):
+    """text[offset:] cut to at most max_chars (default 20000) on a LINE boundary -> (piece, next_offset).
+    next_offset is where the next page starts (just past the newline we cut at), None when nothing is
+    left. A single line longer than the cap is cut mid-line so paging always advances."""
+    n = int(max_chars or 20000)
+    start = min(max(int(offset or 0), 0), len(text))
+    end = start + n
+    if end >= len(text):
+        return text[start:], None
+    cut = end if text[end] == "\n" else text.rfind("\n", start, end)
+    if cut <= start:                       # no usable newline in the window
+        return text[start:end], end
+    return text[start:cut], cut + 1
+
+
+def _trunc_hint(nxt, total, action):
+    again = ("read the next part with offset=%d" % nxt)
+    extra = "" if action == "read" else ", or use read {query}"
+    return (f"truncated at {nxt:,} of {total:,} chars; narrow with query=\"<text>\" or selector=\"<css>\", "
+            f"{again}{extra}")
+
+
+def _read(page, a):
+    """Page text (innerText of selector, default body) by lines, blank lines dropped. query = only the
+    lines containing it (case-insensitive) plus context_lines (default 2) before/after, '…' where the kept
+    runs are not adjacent. Cut like snapshot: line boundary, offset / next_offset, hint."""
+    sel = a.get("selector") or "body"
+    try:
+        raw = page.locator(sel).first.inner_text(timeout=a.get("timeout", 10000))
+    except Exception as ex:
+        raise WbError(f"read: {sel!r}: {(str(ex).splitlines() or [''])[0][:200]}") from None
+    lines = [ln for ln in raw.splitlines() if ln.strip()]
+    query = str(a["query"]) if a.get("query") else ""
+    if query:
+        q, ctx = query.lower(), max(int(a.get("context_lines", 2)), 0)
+        keep = set()
+        for i, ln in enumerate(lines):
+            if q in ln.lower():
+                keep.update(range(max(i - ctx, 0), min(i + ctx + 1, len(lines))))
+        out, prev = [], None
+        for i in sorted(keep):
+            if prev is not None and i != prev + 1:
+                out.append("…")
+            out.append(lines[i])
+            prev = i
+        lines = out
+    text = "\n".join(lines)
+    piece, nxt = _clip(text, a.get("max_chars"), a.get("offset"))
+    res = {"url": page.url, "title": page.title(), "text": piece, "chars": len(text),
+           "full_chars": len(raw), "truncated": nxt is not None}
+    if nxt is not None:
+        res["next_offset"] = nxt
+        res["hint"] = _trunc_hint(nxt, len(text), "read")
+    elif query and not text:
+        res["hint"] = (f"no line contains {query!r}; try another spelling, a broader selector=\"<css>\", "
+                       "or snapshot {query}")
+    return res
 
 
 _STATIC_TYPES = {"image", "stylesheet", "font", "media", "script", "manifest", "texttrack", "other"}
@@ -608,6 +688,25 @@ def _network_capture(page, a):
     return {"url": page.url, "count": len(out), "body_dir": str(body_dir), "requests": out}
 
 
+def _network_capture_action(ctx, session, a):
+    """network_capture needs a tab to record on. With trigger.navigate it is "open the page and record
+    it", so a session without a live tab gets a new one (registered, so close_session closes it);
+    any other trigger acts on the current tab and still raises NoTab if there is none."""
+    trig = a.get("trigger") or {}
+    url = trig.get("navigate") if isinstance(trig, dict) else None
+    if not url:
+        return _network_capture(_current(ctx, session), a)
+    _guard(url)                                  # before any tab is opened
+    m, e, pages = _session_pages(ctx, session)
+    page = next((p for t, p in pages if t == e["current"]), None)
+    if page is None:
+        page = ctx.new_page()
+        _add(m, e, target_id(page))
+    else:
+        _save(m)
+    return _network_capture(page, a)
+
+
 def _cdp(page, a):
     s = page.context.new_cdp_session(page)
     try:
@@ -669,11 +768,80 @@ def _close_session(ctx, session, a):
     return {"success": True, "closed": closed}
 
 
-SESSION_ACTIONS = {"navigate": _navigate, "list_tabs": _list_tabs, "list_browser_tabs": _list_browser_tabs,
-                   "find_tab": _find_tab, "attach_tab": _attach_tab, "close_session": _close_session}
+_JS_TEXT_PRESENT = "t => !!document.body && document.body.innerText.includes(t)"
+
+
+def _wait(page, a):
+    """Wait for ONE condition: text (in document.body.innerText), selector (state, default visible) or
+    js (an expression / function that becomes truthy). A timeout is an answer, not an exception, so a
+    batch can decide whether to go on; a broken selector or JS is a WbError."""
+    given = [k for k in ("text", "selector", "js") if a.get(k) not in (None, "")]
+    if len(given) != 1:
+        raise WbError("wait: give exactly one of text, selector, js")
+    timeout = a.get("timeout", 15000)
+    t0 = time.monotonic()
+    try:
+        if given[0] == "text":
+            page.wait_for_function(_JS_TEXT_PRESENT, arg=str(a["text"]), timeout=timeout, polling=100)
+        elif given[0] == "selector":
+            page.wait_for_selector(a["selector"], state=a.get("state", "visible"), timeout=timeout)
+        else:
+            page.wait_for_function(a["js"], timeout=timeout, polling=100)
+    except Exception as ex:
+        waited = int((time.monotonic() - t0) * 1000)
+        if type(ex).__name__ == "TimeoutError":
+            return {"success": False, "waited_ms": waited}
+        raise WbError(f"wait: {str(ex).splitlines()[0][:200]}") from None
+    return {"success": True, "waited_ms": int((time.monotonic() - t0) * 1000)}
+
+
+def _batch(ctx, session, a):
+    """Run steps [{action, args, quiet?}] in this one process (one driver start, one CDP connection)
+    through wb(), so guards and session mapping behave exactly as for single calls."""
+    steps = a.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise WbError("batch: steps must be a non-empty list of {action, args}")
+    for i, s in enumerate(steps):
+        if not isinstance(s, dict) or not isinstance(s.get("action"), str):
+            raise WbError(f"batch: step {i} needs an action")
+        if s["action"] == "batch":
+            raise WbError(f"batch: step {i}: nested batch is not allowed")
+        if s.get("args") is not None and not isinstance(s["args"], dict):
+            raise WbError(f"batch: step {i}: args must be an object")
+    stop = a.get("stop_on_error", True)
+    results, failed = [], False
+    for s in steps:
+        act = s["action"]
+        if failed and stop:
+            results.append({"action": act, "ok": False, "skipped": True})
+            continue
+        t0 = time.monotonic()
+        try:
+            data, err = wb(act, s.get("args"), session=session), None
+            if isinstance(data, dict) and data.get("success") is False:   # e.g. wait timed out
+                err = f"{act}: timed out after {data.get('waited_ms')} ms" if act == "wait" \
+                    else f"{act}: success is false"
+        except Exception as ex:   # a failing step is a result, whatever it raised
+            first = (str(ex).splitlines() or [""])[0][:300]
+            data, err = None, first if isinstance(ex, WbError) else f"{type(ex).__name__}: {first}"
+        secs = round(time.monotonic() - t0, 3)
+        if err is not None:
+            failed = True
+            results.append({"action": act, "ok": False, "error": err, "secs": secs})
+        elif s.get("quiet"):
+            results.append({"ok": True, "secs": secs})
+        else:
+            results.append({"action": act, "ok": True, "data": data, "secs": secs})
+    return {"ok": not failed, "results": results}
+
+
+SESSION_ACTIONS = {"navigate": _navigate, "network_capture": _network_capture_action,
+                   "list_tabs": _list_tabs, "list_browser_tabs": _list_browser_tabs,
+                   "find_tab": _find_tab, "attach_tab": _attach_tab, "close_session": _close_session,
+                   "batch": _batch}
 PAGE_ACTIONS = {"evaluate": _evaluate, "fill": _fill, "click": _click, "screenshot": _screenshot,
-                "save_as_pdf": _save_as_pdf, "snapshot": _snapshot, "cdp": _cdp,
-                "network_capture": _network_capture}
+                "save_as_pdf": _save_as_pdf, "snapshot": _snapshot, "cdp": _cdp, "wait": _wait,
+                "read": _read}
 
 
 def wb(action, args=None, session="default"):
@@ -708,9 +876,13 @@ def main(argv=None):
     else:
         if len(argv) > 2:
             raise SystemExit(f"deja-cdp: unexpected arguments {argv[2:]} (usage: <action> '<json>' [--session S])")
-        out = wb(cmd, json.loads(argv[1]) if len(argv) > 1 else {}, session=session)
+        try:
+            out = wb(cmd, json.loads(argv[1]) if len(argv) > 1 else {}, session=session)
+        except WbError as ex:    # NoTab included; other exceptions are program bugs and keep their traceback
+            print(json.dumps({"ok": False, "error": str(ex)}, ensure_ascii=False))
+            return 1
     print(json.dumps(out, ensure_ascii=False))
-    return 0
+    return 1 if cmd == "batch" and out.get("ok") is False else 0
 
 
 if __name__ == "__main__":

@@ -27,7 +27,12 @@ class FakeLocator:
         Path(path).write_bytes(b"\xff\xd8shot")
 
     def aria_snapshot(self, timeout=None):
-        return "- heading \"Hi\"\n" * 50
+        return self.page.aria.get(self.sel, "- heading \"Hi\"\n" * 50)
+
+    def inner_text(self, timeout=None):
+        if self.sel not in self.page.texts:
+            raise TimeoutError(f"waiting for {self.sel}")
+        return self.page.texts[self.sel]
 
 
 class FakePage:
@@ -37,6 +42,9 @@ class FakePage:
         self.dom = {}           # selector -> {"readonly": bool, "text": str}
         self.values, self.clicked, self.evals = {}, [], []
         self.pdf_raises = False
+        self.waits, self.wait_fails = [], False
+        self.aria = {}          # selector -> aria_snapshot text (default: 50 heading lines)
+        self.texts = {}         # selector -> innerText
 
     def goto(self, url, wait_until=None, timeout=None):
         self.url = url
@@ -76,6 +84,28 @@ class FakePage:
             raise RuntimeError("PDF generation is only supported for headless")
         Path(path).write_bytes(b"%PDF-1.4 fake")
 
+    def on(self, event, handler):
+        pass
+
+    def remove_listener(self, event, handler):
+        pass
+
+    def wait_for_timeout(self, ms):
+        pass
+
+    def wait_for_function(self, expression, arg=None, timeout=None, polling=None):
+        self.waits.append(("function", expression, arg, timeout))
+        if self.wait_fails:
+            raise TimeoutError(f"Timeout {timeout}ms exceeded.")
+
+    def wait_for_selector(self, selector, state=None, timeout=None):
+        self.waits.append(("selector", selector, state, timeout))
+        if self.wait_fails or selector not in self.dom:
+            raise TimeoutError(f"Timeout {timeout}ms exceeded.")
+
+    def reload(self, wait_until=None, timeout=None):
+        pass
+
     def close(self):
         self.closed = True
         self.context.all_pages.remove(self)
@@ -109,7 +139,7 @@ class FakeCtx:
         return FakeCdp()
 
 
-class EdgeCdpTest(unittest.TestCase):
+class _FakeBrowserCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.ctx = FakeCtx()
@@ -131,6 +161,8 @@ class EdgeCdpTest(unittest.TestCase):
     def nav(self, url="https://a.example/x", session="s1", **kw):
         return ec.wb("navigate", {"url": url, **kw}, session=session)
 
+
+class EdgeCdpTest(_FakeBrowserCase):
     def test_navigate_opens_one_tab_then_reuses_it(self):
         r1 = self.nav()
         self.assertEqual(r1["success"], True)
@@ -246,13 +278,275 @@ class EdgeCdpTest(unittest.TestCase):
         r = ec.wb("attach_tab", {"tabId": "U9"}, session="s3")
         self.assertTrue(r["borrowed"])
         snap = ec.wb("snapshot", {"max_chars": 30}, session="s3")
-        self.assertEqual(len(snap["tree_text"]), 30)
+        self.assertLessEqual(len(snap["tree_text"]), 30)        # cut on a line boundary since the hint work
+        self.assertTrue(snap["truncated"])
         self.assertEqual(ec.wb("cdp", {"method": "Page.getLayoutMetrics"}, session="s3")["method"],
                          "Page.getLayoutMetrics")
 
     def test_unsupported_action(self):
         with self.assertRaises(ec.WbError):
             ec.wb("network", {"cmd": "start"}, session="s1")
+
+    def test_network_capture_navigate_opens_tab_in_fresh_session(self):
+        body = str(Path(self.tmp.name) / "net")
+        r = ec.wb("network_capture", {"trigger": {"navigate": "https://a.example/app"},
+                                      "wait_ms": 0, "body_dir": body}, session="fresh")
+        self.assertEqual(set(r), {"url", "count", "body_dir", "requests"})   # output shape unchanged
+        self.assertEqual(r["url"], "https://a.example/app")
+        self.assertEqual(len(self.ctx.pages), 1)
+        self.assertEqual(len(ec.wb("list_tabs", {}, session="fresh")["tabs"]), 1)
+        self.assertEqual(ec.wb("close_session", {}, session="fresh"), {"success": True, "closed": 1})
+        self.assertEqual(self.ctx.pages, [])
+
+    def test_network_capture_navigate_reuses_existing_tab(self):
+        self.nav(session="s1")
+        ec.wb("network_capture", {"trigger": {"navigate": "https://a.example/y"}, "wait_ms": 0,
+                                  "body_dir": str(Path(self.tmp.name) / "net")}, session="s1")
+        self.assertEqual(len(self.ctx.pages), 1)
+
+    def test_network_capture_without_navigate_still_needs_a_tab(self):
+        for args in ({}, {"trigger": {"reload": True}}, {"trigger": {"click": "#x"}}):
+            with self.assertRaises(ec.NoTab):
+                ec.wb("network_capture", {**args, "wait_ms": 0}, session="fresh")
+        self.assertEqual(self.ctx.pages, [])
+
+    def test_network_capture_denied_host_opens_no_tab(self):
+        with self.assertRaises(ec.WbError):
+            ec.wb("network_capture", {"trigger": {"navigate": "https://mail.google.com/"}, "wait_ms": 0},
+                  session="fresh")
+        self.assertEqual(self.ctx.pages, [])
+
+    def test_network_capture_bad_trigger_type_opens_no_tab(self):
+        with self.assertRaises(ec.WbError):
+            ec.wb("network_capture", {"trigger": "https://a.example/", "wait_ms": 0}, session="fresh")
+        self.assertEqual(self.ctx.pages, [])
+
+
+class CliErrorTest(_FakeBrowserCase):
+    def run_main(self, argv):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = ec.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_notab_prints_json_error_and_rc1(self):
+        rc, out, err = self.run_main(["evaluate", "{}", "--session", "none"])
+        self.assertEqual(rc, 1)
+        j = json.loads(out)
+        self.assertIs(j["ok"], False)
+        self.assertIn("no tab", j["error"])
+        self.assertNotIn("Traceback", err)
+
+    def test_wberror_prints_json_error_and_rc1(self):
+        rc, out, err = self.run_main(["bogus", "{}"])
+        self.assertEqual(rc, 1)
+        self.assertIn("unsupported action", json.loads(out)["error"])
+        self.assertNotIn("Traceback", err)
+
+    def test_programming_errors_are_not_swallowed(self):
+        with mock.patch.object(ec, "wb", side_effect=KeyError("bug")):
+            with self.assertRaises(KeyError):
+                self.run_main(["evaluate", "{}"])
+
+
+class WaitTest(_FakeBrowserCase):
+    def setUp(self):
+        super().setUp()
+        ec.wb("navigate", {"url": "https://a.example/"}, session="w")
+        self.page = self.ctx.pages[0]
+
+    def test_wait_text_polls_inner_text(self):
+        r = ec.wb("wait", {"text": "Results"}, session="w")
+        self.assertIs(r["success"], True)
+        self.assertIsInstance(r["waited_ms"], int)
+        kind, expr, arg, timeout = self.page.waits[0]
+        self.assertEqual(kind, "function")
+        self.assertIn("innerText", expr)
+        self.assertEqual(arg, "Results")
+        self.assertEqual(timeout, 15000)
+
+    def test_wait_selector_default_state_visible(self):
+        self.page.dom["#out"] = {}
+        r = ec.wb("wait", {"selector": "#out", "timeout": 3000}, session="w")
+        self.assertIs(r["success"], True)
+        self.assertEqual(self.page.waits[0], ("selector", "#out", "visible", 3000))
+
+    def test_wait_selector_state_passthrough(self):
+        self.page.dom["#out"] = {}
+        ec.wb("wait", {"selector": "#out", "state": "attached"}, session="w")
+        self.assertEqual(self.page.waits[0][2], "attached")
+
+    def test_wait_js_uses_wait_for_function(self):
+        r = ec.wb("wait", {"js": "() => window.ready === true"}, session="w")
+        self.assertIs(r["success"], True)
+        self.assertEqual(self.page.waits[0], ("function", "() => window.ready === true", None, 15000))
+
+    def test_wait_timeout_returns_failure_not_exception(self):
+        self.page.wait_fails = True
+        for args in ({"text": "x", "timeout": 10}, {"selector": "#nope", "timeout": 10},
+                     {"js": "() => false", "timeout": 10}):
+            r = ec.wb("wait", args, session="w")
+            self.assertIs(r["success"], False)
+            self.assertIn("waited_ms", r)
+
+    def test_wait_needs_exactly_one_condition(self):
+        for args in ({}, {"text": "a", "selector": "b"}):
+            with self.assertRaises(ec.WbError):
+                ec.wb("wait", args, session="w")
+
+    def test_wait_non_timeout_error_is_wberror(self):
+        with mock.patch.object(self.page, "wait_for_function", side_effect=ValueError("SyntaxError: bad js")):
+            with self.assertRaises(ec.WbError) as cm:
+                ec.wb("wait", {"js": "((("}, session="w")
+        self.assertIn("SyntaxError", str(cm.exception))
+
+    def test_wait_without_tab_raises_notab(self):
+        with self.assertRaises(ec.NoTab):
+            ec.wb("wait", {"text": "x"}, session="nobody")
+
+
+class BatchTest(_FakeBrowserCase):
+    def steps(self):
+        return [{"action": "navigate", "args": {"url": "https://a.example/"}},
+                {"action": "wait", "args": {"text": "hello"}},
+                {"action": "evaluate", "args": {"code": "document.title"}}]
+
+    def test_runs_in_order_on_one_page(self):
+        r = ec.wb("batch", {"steps": self.steps()}, session="b")
+        self.assertIs(r["ok"], True)
+        self.assertEqual([x["action"] for x in r["results"]], ["navigate", "wait", "evaluate"])
+        self.assertTrue(all(x["ok"] for x in r["results"]))
+        self.assertEqual(r["results"][0]["data"]["url"], "https://a.example/")
+        self.assertEqual(r["results"][2]["data"], {"type": "string", "value": "T"})
+        self.assertTrue(all(isinstance(x["secs"], float) for x in r["results"]))
+        self.assertEqual(len(self.ctx.pages), 1)                      # one tab for all three steps
+        self.assertEqual(self.ctx.pages[0].waits[0][2], "hello")      # wait + evaluate hit that same page
+        self.assertEqual(len(self.ctx.pages[0].evals), 1)
+
+    def test_args_optional(self):
+        r = ec.wb("batch", {"steps": [{"action": "navigate", "args": {"url": "https://a.example/"}},
+                                      {"action": "list_tabs"}]}, session="b")
+        self.assertIs(r["ok"], True)
+        self.assertEqual(len(r["results"][1]["data"]["tabs"]), 1)
+
+    def test_failure_stops_and_skips_the_rest(self):
+        steps = self.steps()
+        steps.insert(1, {"action": "click", "args": {"selector": "#missing"}})
+        r = ec.wb("batch", {"steps": steps}, session="b")
+        self.assertIs(r["ok"], False)
+        self.assertEqual([x["ok"] for x in r["results"]], [True, False, False, False])
+        self.assertIn("missing", r["results"][1]["error"])
+        self.assertNotIn("data", r["results"][1])
+        self.assertTrue(r["results"][2].get("skipped") and r["results"][3].get("skipped"))
+        self.assertEqual(r["results"][2]["action"], "wait")
+        self.assertEqual(self.ctx.pages[0].evals, [])                 # the skipped evaluate never ran
+
+    def test_stop_on_error_false_keeps_going(self):
+        steps = self.steps()
+        steps.insert(1, {"action": "click", "args": {"selector": "#missing"}})
+        r = ec.wb("batch", {"steps": steps, "stop_on_error": False}, session="b")
+        self.assertIs(r["ok"], False)
+        self.assertEqual([x["ok"] for x in r["results"]], [True, False, True, True])
+        self.assertFalse(any(x.get("skipped") for x in r["results"]))
+
+    def test_nested_batch_rejected_before_anything_runs(self):
+        steps = [{"action": "navigate", "args": {"url": "https://a.example/"}},
+                 {"action": "batch", "args": {"steps": []}}]
+        with self.assertRaises(ec.WbError) as cm:
+            ec.wb("batch", {"steps": steps}, session="b")
+        self.assertIn("nested", str(cm.exception))
+        self.assertEqual(self.ctx.pages, [])
+
+    def test_bad_step_shapes_rejected(self):
+        for bad in ({}, {"steps": []}, {"steps": "x"}, {"steps": [{"args": {}}]}, {"steps": [["navigate"]]},
+                    {"steps": [{"action": "navigate", "args": "u"}]}):
+            with self.assertRaises(ec.WbError, msg=bad):
+                ec.wb("batch", bad, session="b")
+
+    def test_unknown_action_is_a_step_error(self):
+        r = ec.wb("batch", {"steps": [{"action": "bogus"}]}, session="b")
+        self.assertIs(r["ok"], False)
+        self.assertIn("unsupported action", r["results"][0]["error"])
+
+    def test_guard_still_blocks_navigate_inside_batch(self):
+        steps = [{"action": "navigate", "args": {"url": "https://mail.google.com/"}},
+                 {"action": "evaluate", "args": {"code": "1+1"}}]
+        r = ec.wb("batch", {"steps": steps}, session="b")
+        self.assertIs(r["ok"], False)
+        self.assertFalse(r["results"][0]["ok"])
+        self.assertTrue(r["results"][1]["skipped"])
+        self.assertEqual(self.ctx.pages, [])                          # no tab was opened
+
+    def test_quiet_drops_the_payload(self):
+        steps = self.steps()
+        steps[0]["quiet"] = True
+        steps[2]["quiet"] = True
+        r = ec.wb("batch", {"steps": steps}, session="b")
+        self.assertEqual(set(r["results"][0]), {"ok", "secs"})
+        self.assertEqual(set(r["results"][2]), {"ok", "secs"})
+        self.assertIn("data", r["results"][1])                         # not quiet -> full result
+        self.assertIn("action", r["results"][1])
+
+    def test_quiet_does_not_hide_errors(self):
+        r = ec.wb("batch", {"steps": [{"action": "click", "args": {"selector": "#x"}, "quiet": True}]},
+                  session="b")
+        self.assertIn("error", r["results"][0])
+
+    def test_wait_timeout_in_batch_is_a_failed_step(self):
+        steps = self.steps()
+        steps[1]["args"]["timeout"] = 10
+        orig = ec.PAGE_ACTIONS["wait"]
+
+        def timing_out(page, a):
+            page.wait_fails = True
+            try:
+                return orig(page, a)
+            finally:
+                page.wait_fails = False
+        with mock.patch.dict(ec.PAGE_ACTIONS, {"wait": timing_out}):
+            r = ec.wb("batch", {"steps": steps}, session="b")
+        self.assertIs(r["ok"], False)
+        self.assertEqual([x["ok"] for x in r["results"]], [True, False, False])
+        self.assertIn("timed out", r["results"][1]["error"])
+        self.assertTrue(r["results"][2]["skipped"])
+        self.assertEqual(self.ctx.pages[0].evals, [])                 # the step after the failed wait never ran
+
+    def test_quiet_wait_timeout_is_still_visible(self):
+        steps = [{"action": "navigate", "args": {"url": "https://a.example/"}, "quiet": True},
+                 {"action": "wait", "args": {"text": "x", "timeout": 10}, "quiet": True}]
+        with mock.patch.dict(ec.PAGE_ACTIONS, {"wait": lambda page, a: {"success": False, "waited_ms": 10}}):
+            r = ec.wb("batch", {"steps": steps}, session="b")
+        self.assertIs(r["ok"], False)
+        self.assertIn("error", r["results"][1])
+        self.assertIn("timed out", r["results"][1]["error"])
+
+    def test_wait_timeout_in_batch_continues_when_stop_on_error_false(self):
+        steps = self.steps()
+        orig = ec.PAGE_ACTIONS["wait"]
+        with mock.patch.dict(ec.PAGE_ACTIONS, {"wait": lambda page, a: {"success": False, "waited_ms": 7}}):
+            r = ec.wb("batch", {"steps": steps, "stop_on_error": False}, session="b")
+        self.assertIs(r["ok"], False)
+        self.assertEqual([x["ok"] for x in r["results"]], [True, False, True])
+        self.assertIn("7 ms", r["results"][1]["error"])
+
+    def test_unexpected_exception_becomes_step_error(self):
+        steps = self.steps()
+        with mock.patch.dict(ec.PAGE_ACTIONS, {"evaluate": mock.Mock(side_effect=KeyError("boom"))}):
+            r = ec.wb("batch", {"steps": steps}, session="b")
+        self.assertIs(r["ok"], False)
+        self.assertIn("boom", r["results"][2]["error"])
+
+    def test_cli_batch_json_and_exit_code(self):
+        rc, out, err = CliErrorTest.run_main(self, ["batch", json.dumps({"steps": self.steps()}), "--session", "b"])
+        self.assertEqual(rc, 0)
+        self.assertIs(json.loads(out)["ok"], True)
+        rc, out, err = CliErrorTest.run_main(
+            self, ["batch", json.dumps({"steps": [{"action": "click", "args": {"selector": "#z"}}]}),
+                   "--session", "b"])
+        self.assertEqual(rc, 1)
+        self.assertIs(json.loads(out)["ok"], False)
 
 
 class LaunchTest(unittest.TestCase):
@@ -290,6 +584,147 @@ class LaunchTest(unittest.TestCase):
             r = ec.stop()
             self.assertIsNone(r["killed"])
             self.assertEqual(run.call_count, 1)                 # no taskkill
+
+
+class SnapshotReadTest(_FakeBrowserCase):
+    """snapshot truncation (line boundary, offset, hint) and the filterable `read` action."""
+
+    ROWS = [f"- row {i:03d}: item" for i in range(100)]            # 100 lines, each 15 chars
+    BODY = "\n".join(ROWS)
+
+    def page(self, session="s1"):
+        self.nav(session=session)
+        return self.ctx.pages[-1]
+
+    def snap(self, **a):
+        return ec.wb("snapshot", a, session="s1")
+
+    def test_snapshot_truncates_on_a_line_boundary_with_a_hint(self):
+        self.page().aria["body"] = self.BODY
+        r = self.snap(max_chars=100)
+        self.assertTrue({"url", "title", "tree_text", "chars", "full_chars", "truncated"} <= set(r))
+        self.assertTrue(r["truncated"])
+        self.assertEqual((r["chars"], r["full_chars"]), (len(self.BODY), len(self.BODY)))
+        self.assertLessEqual(len(r["tree_text"]), 100)
+        self.assertTrue(all(ln in self.ROWS for ln in r["tree_text"].splitlines()))   # no half lines
+        self.assertEqual(r["next_offset"], len(r["tree_text"]) + 1)                   # past the newline
+        for needle in (f"{r['next_offset']:,} of {r['chars']:,}", "query=", "selector=",
+                       f"offset={r['next_offset']}", "read {query}"):
+            self.assertIn(needle, r["hint"])
+
+    def test_snapshot_offset_pages_chain_back_to_the_full_text(self):
+        self.page().aria["body"] = self.BODY
+        parts, off = [], 0
+        for _ in range(100):
+            r = self.snap(max_chars=100, offset=off)
+            parts.append(r["tree_text"])
+            if not r["truncated"]:
+                break
+            off = r["next_offset"]
+        self.assertGreater(len(parts), 1)
+        self.assertEqual("\n".join(parts), self.BODY)
+        self.assertNotIn("hint", r)                      # the last page is complete: no hint
+        self.assertNotIn("next_offset", r)
+
+    def test_snapshot_not_truncated_has_no_hint(self):
+        self.page().aria["body"] = "\n".join(self.ROWS[:3])
+        r = self.snap(max_chars=100)
+        self.assertFalse(r["truncated"])
+        self.assertEqual(r["tree_text"], "\n".join(self.ROWS[:3]))
+        self.assertNotIn("hint", r)
+        self.assertNotIn("next_offset", r)
+
+    def test_snapshot_default_cap_is_unchanged_and_offset_applies_after_query(self):
+        self.page().aria["body"] = "\n".join(f"- line {i} {'x' * 20}" for i in range(2000))   # ~56k chars
+        r = self.snap()
+        self.assertTrue(r["truncated"])
+        self.assertLessEqual(len(r["tree_text"]), 20000)
+        self.assertGreater(len(r["tree_text"]), 19900)
+        q = self.snap(query="line 1999", offset=0)
+        self.assertEqual(q["tree_text"], "- line 1999 " + "x" * 20)
+        self.assertFalse(q["truncated"])
+
+    def test_snapshot_single_line_longer_than_the_cap_still_advances(self):
+        self.page().aria["body"] = "y" * 250
+        r1 = self.snap(max_chars=100)
+        self.assertEqual((len(r1["tree_text"]), r1["next_offset"]), (100, 100))
+        r3 = self.snap(max_chars=100, offset=200)
+        self.assertEqual(r3["tree_text"], "y" * 50)
+        self.assertFalse(r3["truncated"])
+
+    def test_snapshot_offset_past_the_end_is_empty(self):
+        self.page().aria["body"] = "\n".join(self.ROWS[:3])
+        r = self.snap(offset=9999)
+        self.assertEqual((r["tree_text"], r["truncated"]), ("", False))
+
+    # ---- read ----
+    TEXT = ("Intro paragraph\n\nAlpha 1\nBeta 2\n\nIron\n55.845\nFe\n\nGamma 3\nDelta 4\nEpsilon 5\n"
+            "Zeta 6\nEta 7\nTheta 8\nIota 9\nKappa 10\nLambda IRON again\nMu 12")
+
+    def test_read_without_query_returns_the_text_and_old_style_fields(self):
+        self.page().texts["body"] = "Hello\nWorld"
+        r = ec.wb("read", {}, session="s1")
+        self.assertEqual(r["text"], "Hello\nWorld")
+        self.assertEqual((r["chars"], r["full_chars"], r["truncated"]), (11, 11, False))
+        self.assertEqual(r["url"], "https://a.example/x")
+        self.assertEqual(r["title"], "title:https://a.example/x")
+        self.assertNotIn("hint", r)
+
+    def test_read_query_keeps_hit_lines_with_context_and_gap_markers(self):
+        self.page().texts["body"] = self.TEXT
+        r = ec.wb("read", {"query": "iron", "context_lines": 1}, session="s1")      # case-insensitive
+        self.assertEqual(r["text"].splitlines(), ["Beta 2", "Iron", "55.845", "…", "Kappa 10",
+                                                  "Lambda IRON again", "Mu 12"])
+        self.assertIn("55.845", r["text"])
+        self.assertLess(r["chars"], r["full_chars"])
+        self.assertFalse(r["truncated"])
+
+    def test_read_query_default_context_is_two_lines_and_merges_close_hits(self):
+        self.page().texts["body"] = "a\nb\nc\nHIT\nd\ne\nf\nHIT\ng"
+        r = ec.wb("read", {"query": "hit"}, session="s1")
+        self.assertEqual(r["text"].splitlines(), ["b", "c", "HIT", "d", "e", "f", "HIT", "g"])   # no "…"
+
+    def test_read_query_without_a_match_returns_empty_text_and_a_hint(self):
+        self.page().texts["body"] = self.TEXT
+        r = ec.wb("read", {"query": "unobtainium"}, session="s1")
+        self.assertEqual((r["text"], r["chars"], r["truncated"]), ("", 0, False))
+        self.assertEqual(r["full_chars"], len(self.TEXT))
+        self.assertIn("unobtainium", r["hint"])
+
+    def test_read_selector_scopes_the_text(self):
+        p = self.page()
+        p.texts["body"] = "whole page Iron"
+        p.texts["#table"] = "table only Iron"
+        r = ec.wb("read", {"selector": "#table", "query": "iron"}, session="s1")
+        self.assertEqual(r["text"], "table only Iron")
+        with self.assertRaises(ec.WbError):
+            ec.wb("read", {"selector": "#missing"}, session="s1")
+
+    def test_read_truncates_on_lines_and_offset_pages_through(self):
+        self.page().texts["body"] = "\n".join(f"line {i:02d} text" for i in range(50))     # 12 chars/line
+        r = ec.wb("read", {"max_chars": 100}, session="s1")
+        self.assertTrue(r["truncated"])
+        self.assertTrue(all(ln.startswith("line ") and ln.endswith(" text") for ln in r["text"].splitlines()))
+        self.assertIn(f"offset={r['next_offset']}", r["hint"])
+        self.assertIn("query=", r["hint"])
+        parts, off = [], 0
+        for _ in range(100):
+            p = ec.wb("read", {"max_chars": 100, "offset": off}, session="s1")
+            parts.append(p["text"])
+            if not p["truncated"]:
+                break
+            off = p["next_offset"]
+        self.assertEqual("\n".join(parts), "\n".join(f"line {i:02d} text" for i in range(50)))
+
+    def test_read_works_inside_a_batch(self):
+        self.page().texts["body"] = "x\nIron 55.845\ny"
+        r = ec.wb("batch", {"steps": [{"action": "read", "args": {"query": "iron"}}]}, session="s1")
+        self.assertTrue(r["ok"])
+        self.assertIn("55.845", r["results"][0]["data"]["text"])
+
+    def test_read_without_a_tab_raises_notab(self):
+        with self.assertRaises(ec.NoTab):
+            ec.wb("read", {}, session="nobody")
 
 
 # snapshot/network helpers (tests moved from site_recipe, 2026-11-11)

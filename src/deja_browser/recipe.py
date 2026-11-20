@@ -17,6 +17,8 @@ Recipe file: <recipes dir>/<host>/<name>.json   (id = "<host>/<name>"; dir = [re
                                                           # in-process, never printed/returned)
     "script": "<async fn body of (args), returns small JSON>",   # DOM/form recipe (instead of request)
     "pick": {"path": "hits", "fields": ["title", "url"], "limit": 20},   # shrink the result
+             # or {"select": {"version": "crate.max_stable_version"}}: name -> dotted path (a number
+             # indexes a list); on a list result it is applied to every row
     "writes": false,                                      # true = side effects -> needs --allow-write
     "driver": "playwright",                               # optional; default is patchright
     "login": {"check": "<JS expr -> true when logged in>", "url", "user_secret", "pass_secret",
@@ -38,8 +40,16 @@ whisper; text-image CAPTCHAs -> solve_image_captcha() (ddddocr). The human is th
 CLI:
   deja-browser list
   deja-browser show <id>
-  deja-browser run <id> '<json args>' [--tier http|page|script] [--allow-write]
-  deja-browser verify <draft.json> '<json args>'     try every tier, print shape + preview
+  deja-browser run <id> '<json args>' [--tier http|page|script] [--allow-write] [--data-only]
+      reserved arg "_limit": N  keeps at most N list items (only lowers the recipe's pick.limit)
+      --data-only  prints just the data on success (no ok/tier envelope)
+  deja-browser draft <capture.json> --expect "<text the answer needs>" [--expect …] [--param name=value …]
+                     [--name N] [--entry-url U] [--out FILE] [--force] [--keep-param NAME …]
+      capture.json = the output of `deja-cdp network_capture`. Writes a request draft from the response that
+      holds every --expect (params: the captured value becomes {name}); exit 2 + "applicable": false when no
+      JSON API holds the answer (nothing is written). Credential-looking query/body fields are dropped
+      unless named by --keep-param (public client keys). Review it, then verify. Rules: see draft.py.
+  deja-browser verify <draft.json> '<json args>'     try every tier, print shape + preview + output size
   deja-browser save <draft.json>                     needs a passing verify of THIS draft
   deja-browser gate <url>                            open url, clear any challenge, report
 """
@@ -51,13 +61,15 @@ from pathlib import Path
 if importlib.util.find_spec("patchright"):
     os.environ.setdefault("EDGE_CDP_DRIVER", "patchright")
 from . import browser  # noqa: E402
-from . import config, guard, hcaptcha, notify, secretstore  # noqa: E402
+from . import config, draft, guard, hcaptcha, notify, secretstore  # noqa: E402
 # patchright by default (2026-11-11 live test): with plain playwright the Cloudflare full-page
 # interstitial re-rendered its checkbox after the click (= rejected, Runtime.enable CDP signal);
 # patchright passed it on the first click. A recipe may still say "driver": "playwright".
 
 RECIPES = config.path("recipes", "dir", config.data_dir() / "recipes")
 MAX_OUT = 20000
+PREVIEW_OUT = 2000       # verify prints at most this much of a tier's result
+PAGE_RATIO = 0.5         # verify warns when a recipe's output is more than this share of the page's text
 # deny / ticket host lists live in guard.py (shared with the browser layer)
 DENY_HOSTS, TICKET_HOSTS, TICKET_HOSTS_DEFAULT = guard.DENY_HOSTS, guard.TICKET_HOSTS, guard.TICKET_HOSTS_DEFAULT
 _ticket_hosts = guard.ticket_hosts
@@ -91,18 +103,21 @@ def _secret(name):
         raise RecipeError(str(ex)) from None
 
 
-_PH = re.compile(r"\{(secret:)?([A-Za-z_][A-Za-z0-9_]*)\}")
+_PH = re.compile(r"\{(secret:)?([A-Za-z_][A-Za-z0-9_]*)(\|url)?\}")
 
 
 def _render(x, args, secrets_ok=True):
-    """Fill {param} / {secret:NAME} in every string of a JSON-ish structure."""
+    """Fill {param} / {param|url} / {secret:NAME} in every string of a JSON-ish structure."""
     if isinstance(x, str):
         def sub(m):
             if m.group(1):
                 if not secrets_ok:
                     raise RecipeError("secrets are not allowed in this field")
                 return _secret(m.group(2))
-            return str(args[m.group(2)]) if m.group(2) in args else m.group(0)
+            if m.group(2) not in args:
+                return m.group(0)
+            v = str(args[m.group(2)])
+            return urllib.parse.quote(v, safe="") if m.group(3) else v   # {name|url}: percent-encoded
         return _PH.sub(sub, x)
     if isinstance(x, list):
         return [_render(v, args, secrets_ok) for v in x]
@@ -150,15 +165,40 @@ def sig_ok(want, got, top=True):
     return False
 
 
-def pick(data, spec):
+def _dig(data, path):
+    """Value at a dotted path; a number indexes a list. Missing anywhere -> None."""
+    for part in (path or "").split("."):
+        if not part:
+            continue
+        if isinstance(data, dict):
+            data = data.get(part)
+        elif isinstance(data, list) and part.isdigit() and int(part) < len(data):
+            data = data[int(part)]
+        else:
+            return None
+    return data
+
+
+def pick(data, spec, limit=None):
+    """Shrink `data` by a recipe's pick spec. `limit` (a run-time `_limit`) can only lower the saved
+    pick.limit, never raise it."""
+    if limit is not None:
+        spec = dict(spec or {})
+        # a recipe with a pick spec but no limit has the default 50; with no spec at all, no cap
+        spec["limit"] = min(limit, int(spec.get("limit", 50))) if spec else limit
     if not spec:
         return data
     for part in (spec.get("path") or "").split("."):
         if part:
             data = data.get(part) if isinstance(data, dict) else None
+    sel = spec.get("select")
+    if sel and isinstance(data, dict):     # {"name": "dotted.path"} -> {"name": value}
+        return {k: _dig(data, p) for k, p in sel.items()}
     if isinstance(data, list):
         data = data[: int(spec.get("limit", 50))]
-        if spec.get("fields"):
+        if sel:
+            data = [{k: _dig(d, p) for k, p in sel.items()} if isinstance(d, dict) else d for d in data]
+        elif spec.get("fields"):
             data = [{f: d.get(f) for f in spec["fields"]} if isinstance(d, dict) else d for d in data]
     return data
 
@@ -604,6 +644,25 @@ def _out(data):
     return data if len(s) <= MAX_OUT else {"truncated": True, "chars": len(s), "head": s[:MAX_OUT]}
 
 
+def _preview(data, n=PREVIEW_OUT):
+    s = json.dumps(data, ensure_ascii=False)
+    return data if len(s) <= n else {"truncated": True, "chars": len(s), "head": s[:n]}
+
+
+def _take_limit(given):
+    """Split the reserved `_limit` run parameter off the caller's args -> (args, limit|None)."""
+    given = dict(given or {})
+    raw = given.pop("_limit", None)
+    if raw is None:
+        return given, None
+    if isinstance(raw, str) and raw.strip().isdigit():
+        raw = int(raw)
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise RecipeError("_limit must be a non-negative integer")
+    limit = raw
+    return given, limit
+
+
 # ---------- store ----------
 
 def _path(rid):
@@ -632,7 +691,8 @@ def _draft_hash(d):
     return hashlib.sha256(json.dumps(keep, sort_keys=True).encode()).hexdigest()[:16]
 
 
-def cmd_run(rid, given, tier=None, allow_write=False):
+def cmd_run(rid, given, tier=None, allow_write=False, data_only=False):
+    given, limit = _take_limit(given)
     rec = load(rid)
     res = run(rec, given, tier, allow_write)
     rec["last_run"] = {"at": _now(), "ok": res["ok"], "tier": res.get("tier"),
@@ -642,8 +702,81 @@ def cmd_run(rid, given, tier=None, allow_write=False):
         rec["tier"] = res["tier"]
     _write(_path(rid), rec)
     if res["ok"]:
-        res["data"] = _out(pick(res["data"], rec.get("pick")))
+        res["data"] = _out(pick(res["data"], rec.get("pick"), limit))
+        if not res["tried"]:
+            del res["tried"]       # nothing fell through: don't spend output on an empty list
+        if data_only:
+            return res["data"]
     return res
+
+
+def _page_chars(recipe, session):
+    """Length of the entry page's visible text — what reading the page instead would cost. None when
+    it can't be measured (no browser, or the page is a challenge, whose text says nothing)."""
+    try:
+        page = _page_for(recipe, session)
+        if challenge(page):
+            return None
+        return int(page.evaluate("() => (document.body ? document.body.innerText : '').length"))
+    except Exception:
+        return None
+
+
+def cmd_draft(argv):
+    """`draft <capture.json> --expect S … [--param n=v …]` -> report dict (draft file written when applicable)."""
+    import argparse
+    ap = argparse.ArgumentParser(prog="deja-browser draft", add_help=False)
+    ap.add_argument("capture")
+    ap.add_argument("--expect", action="append", default=[])
+    ap.add_argument("--param", action="append", default=[])
+    ap.add_argument("--name")
+    ap.add_argument("--entry-url")
+    ap.add_argument("--description")
+    ap.add_argument("--out")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--keep-param", action="append", default=[])
+    try:
+        ns = ap.parse_args(argv)
+    except SystemExit:
+        raise RecipeError("usage: draft <capture.json> --expect <text> [--expect …] [--param name=value …] "
+                          "[--name N] [--entry-url U] [--out FILE] [--force] [--keep-param NAME]") from None
+    params = {}
+    for kv in ns.param:
+        k, eq, v = kv.partition("=")
+        if not eq or not k:
+            raise RecipeError(f"--param wants name=value, got {kv!r}")
+        params[k] = v
+    cap_path = Path(ns.capture)
+    try:
+        capture = json.loads(cap_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as ex:
+        raise RecipeError(f"cannot read capture {ns.capture}: {ex}") from None
+    if ns.entry_url:
+        _check_host(ns.entry_url)
+
+    def host_ok(url):
+        try:
+            guard.check_host(url)
+            return True
+        except guard.HostRefused:
+            return False
+    try:
+        rep = draft.build(capture, ns.expect, params, name=ns.name, entry_url=ns.entry_url,
+                          description=ns.description, host_ok=host_ok, keep=ns.keep_param)
+    except draft.DraftError as ex:
+        raise RecipeError(str(ex)) from None
+    if not rep["applicable"]:
+        return rep
+    d = rep["draft"]
+    _check_host(d["entry_url"])
+    out = Path(ns.out) if ns.out else cap_path.with_suffix(".draft.json")
+    if out.exists() and not ns.force:
+        raise RecipeError(f"{out} exists; pass --force to overwrite it, or --out <file>")
+    _write(out, d)
+    sample = json.dumps(params, ensure_ascii=False)
+    rep["draft_path"] = str(out)
+    rep["next"] = f"{Path(sys.argv[0]).name} verify {out} '{sample}'"
+    return rep
 
 
 def cmd_verify(draft_path, given):
@@ -658,16 +791,28 @@ def cmd_verify(draft_path, given):
     for t in _ladder(d):
         r = run(d, given, tier=t, allow_write=True, check_sig=False)
         if r["ok"]:
-            sigs[t] = signature(pick(r["data"], d.get("pick")))
-            results.append({"tier": t, "ok": True, "preview": _out(pick(r["data"], d.get("pick")))})
+            picked = pick(r["data"], d.get("pick"))
+            sigs[t] = signature(picked)
+            same = next((u for u, g in sigs.items() if u != t and g == sigs[t]), None)
+            results.append({"tier": t, "ok": True, "out_chars": len(json.dumps(picked, ensure_ascii=False)),
+                            "preview": f"same shape as {same}" if same else _preview(picked)})
         else:
             results.append({"tier": t, "ok": False, "tried": r["tried"]})
     passed = [r["tier"] for r in results if r["ok"]]
     side = Path(draft_path).with_suffix(".verified.json")
     _write(side, {"at": time.time(), "hash": _draft_hash(d), "passed": passed,
                   "signature": sigs[passed[0]] if passed else None, "args": given})
-    return {"passed": passed, "cheapest": passed[0] if passed else None, "results": results,
-            "next": f"{Path(sys.argv[0]).name} save {draft_path}" if passed else "fix the draft and verify again"}
+    out = {"passed": passed, "cheapest": passed[0] if passed else None, "results": results,
+           "next": f"{Path(sys.argv[0]).name} save {draft_path}" if passed else "fix the draft and verify again"}
+    if passed:
+        pc = _page_chars(d, f"recipe-{_host(d['entry_url'])}")
+        if pc is not None:
+            out["page_chars"] = pc
+            big = next(r for r in results if r["ok"])["out_chars"]
+            if big > pc * PAGE_RATIO:
+                out["warning"] = (f"recipe output ({big} chars) is not much smaller than the page's text "
+                                  f"({pc} chars) — return only the fields the answer needs, or just read the page")
+    return out
 
 
 def cmd_save(draft_path):
@@ -712,7 +857,7 @@ def cmd_gate(url, session="recipe-gate"):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    flags = {f for f in ("--allow-write",) if f in argv}
+    flags = {f for f in ("--allow-write", "--data-only") if f in argv}
     argv = [a for a in argv if a not in flags]
     tier = None
     if "--tier" in argv:
@@ -730,7 +875,11 @@ def main(argv=None):
         elif cmd == "show":
             out = load(rest[0])
         elif cmd == "run":
-            out = cmd_run(rest[0], js(1), tier, "--allow-write" in flags)
+            out = cmd_run(rest[0], js(1), tier, "--allow-write" in flags, "--data-only" in flags)
+        elif cmd == "draft":
+            out = cmd_draft(rest)
+            print(json.dumps(out, ensure_ascii=False))
+            return 0 if out.get("applicable") else 2
         elif cmd == "verify":
             out = cmd_verify(rest[0], js(1))
         elif cmd == "save":

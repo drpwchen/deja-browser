@@ -4,7 +4,30 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] — 2026-11-20
+
+### Added
+- `wait` action: `{text | selector | js, timeout=15000, state="visible"}` → `{success, waited_ms}`. A timeout returns `success: false` instead of raising.
+- `batch` action (`deja-cdp batch '{"steps":[…]}'`): runs several actions in one process and one CDP connection, so the ~0.5 s driver start is paid once instead of per call. Returns `{ok, results:[{action, ok, data | error, secs}]}`; a failed step (an error, or a `wait` that timed out) skips the rest unless `stop_on_error` is false; `quiet: true` keeps only `{ok, secs}` for a step; nesting is refused; every step goes through the normal host guard. Exit code 1 when any step failed.
+
+- `read` action: `{selector="body", query, context_lines=2, max_chars=20000, offset}` → `{url, title, text, chars, full_chars, truncated, next_offset?, hint?}`. Reads the page's `innerText` by lines; with `query` it keeps only the matching lines (case-insensitive) plus `context_lines` around them, with `…` between gaps — a big page answers in a few hundred characters instead of a full snapshot. A query with no match returns empty `text` and a `hint`.
+- `snapshot` takes `offset` and returns `next_offset` when truncated, so a long tree can be read in pages.
+- `deja-browser run <id> '{"_limit": N}'`: a reserved argument that keeps at most N list items of the result. It only lowers the recipe's saved `pick.limit` (it cannot raise it), is not a template parameter and does not take part in the shape check. A 20-item recipe replayed with `_limit: 3` prints about a sixth of the characters.
+- `deja-browser run … --data-only` prints just the data on success; a failed run still prints the full `{ok: false, tried}` report.
+- `deja-browser verify` reports `out_chars` per passing tier and `page_chars` (the entry page's visible text). When the recipe's output is more than half of the page's text it adds a `warning` that a plain read may be cheaper. Not measured (no `page_chars`, no warning) when the page can't be read or is a challenge page.
+
+- `deja-browser draft <capture.json> --expect "<text the answer needs>" [--expect …] [--param name=value …]`: writes a `request` recipe draft from a `network_capture` result, so a site with a JSON API goes from first visit to `verify` without hand-writing the JSON. The response is picked by the `--expect` strings (it must be a 2xx JSON response that contains all of them), not by how it looks. A `--param` value that equals a URL path segment, query value or body string becomes a placeholder; the `pick` is `{path, fields}` when the answers are rows of one list, or `{select}` when they are single values. The report lists where each string was found, other candidate responses and warnings (a value found in several places, an ambiguous field, a POST). When no JSON response holds the answer (the data is in the HTML) it prints `"applicable": false` with a hint to write a `script` recipe, writes no file and exits with code 2. Header values are never copied (except Content-Type / Accept); query and body fields that look like credentials are dropped unless named with `--keep-param`; non-GET drafts get `"writes": true`.
+- Recipe `pick` accepts `select`: `{"name": "dotted.path"}` (a number in the path indexes a list) → `{"name": value}`; on a list result it is applied to every row. Existing recipes are unaffected.
+- A `{param|url}` placeholder in a recipe is percent-encoded when filled in (`{param}` is still inserted as is).
+
+### Changed
+- `deja-browser verify` prints a tier's preview in full only the first time: a later tier with the same result shape prints `"same shape as <tier>"`, and a preview's content is capped at 2,000 characters (it used to print every tier in full, up to 20,000 each).
+- `deja-browser run` leaves out `tried` when no tier fell through (it was an empty list); a run that did fall back still lists what failed.
+- `snapshot` truncation now cuts on a line boundary (it used to cut mid-line, so `tree_text` can be up to one line shorter than `max_chars`) and adds a `hint` that says how to narrow (`query`, `selector`, `read {query}`) or page on (`offset`). The default cap (20,000) and the existing fields (`tree_text`, `chars`, `full_chars`, `truncated`) are unchanged; `next_offset` and `hint` appear only when truncated.
+
+### Fixed
+- `network_capture` with `trigger.navigate` now opens a tab when the session has none (it used to fail with `NoTab: … navigate first`); other triggers still need a tab. The host guard runs before the tab is opened.
+- `deja-cdp <action>` failures from the driver (`NoTab`, unsupported action, a missing required argument) print `{"ok": false, "error": "…"}` and exit 1 instead of a Python traceback, like `deja-browser` already did. Unexpected exceptions still raise.
 
 ## [0.1.4] — 2026-11-14
 

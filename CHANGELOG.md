@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-11-21
+
+### Added
+- `docs/benchmark.md`: a small benchmark of deja-browser against agent-browser, Ego Lite and Claude in Chrome on five public pages, including a run where one model drove deja and Claude in Chrome from the same neutral prompt, and the conditions that favour deja. Linked from the README comparison table. No code changes.
+
 ## [0.3.0] — 2026-11-21
 
 ### Added

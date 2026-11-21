@@ -12,7 +12,7 @@
 recipe replay 588 characters of JSON. Wall time (median of 3) 3.5 s plus model reading vs 1.1 s.*
 
 - **Learn once, replay.** The first visit finds the site's JSON endpoint or form and saves it as a
-  *recipe*; later visits replay it without reading the page — **~50× less text** for the model.
+  *recipe*; later visits replay it without reading the page — **~50× less text** for the model in the demo above.
 - **Not your browser.** A separate Chromium profile driven over CDP on `127.0.0.1`. No extension
   in your everyday browser; your mail, bank and broker are simply not logged in there.
 - **No telemetry, tested.** [`tests/egress/run.sh`](https://github.com/drpwchen/deja-browser/blob/main/tests/egress/run.sh)
@@ -98,6 +98,8 @@ addressed as `<host>/<name>`. `deja-browser --help` documents the full format.
 | Keeping it off sensitive sites | browsers no longer let you fence such extensions away from chosen sites | those sites are simply not logged in; a refused-host list as a guard rail |
 | Outbound traffic | some phone home with no way to turn it off | none of its own, checked by an egress test |
 | Repeat visits | read the page again | replay a recipe (~50× less text in the demo) |
+
+A small benchmark against agent-browser, Ego Lite and Claude in Chrome, with the conditions that favour deja: [docs/benchmark.md](https://github.com/drpwchen/deja-browser/blob/main/docs/benchmark.md).
 
 ## What it does
 

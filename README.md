@@ -122,7 +122,8 @@ addressed as `<host>/<name>`. `deja-browser --help` documents the full format.
 - **No passwords in the profile.** On launch its password, card and address autofill is turned
   off, and a password-manager extension installed in it triggers a warning.
 - **CAPTCHA gate.** Waits for Turnstile / Cloudflare to clear, then tries one trusted checkbox
-  click. Local solvers (reCAPTCHA audio via `faster-whisper`, text CAPTCHAs via `ddddocr`) run only
+  click. Local solvers (reCAPTCHA audio via `faster-whisper`, text CAPTCHAs via `ddddocr` — also
+  the `captcha_text` action for login forms) run only
   if you install those extras; the hCaptcha solver only if you enable it. Otherwise it notifies you.
   `deja-browser gate <url>` opens a URL, clears any challenge and reports.
 - **Guard rails.** `navigate` and recipes refuse mail, account sign-in, banking, brokerage and
@@ -202,6 +203,10 @@ Optional. Copy `config.example.toml` to:
 or point `DEJA_BROWSER_CONFIG` at a file. It covers the browser executable and profile, the
 recipes directory, extra denied hosts, the secret backend (`keyring` / `command` / `env` /
 `python`), and notifications (an ntfy URL or any command; default is stderr).
+
+If the CDP port (`port`, default 9222) is already taken by another browser, `deja-cdp` does not stop
+there: a browser left behind by deja-browser's own test suite is closed, and anything else is left
+running while the agent browser starts on the next free port, remembered in `<profile>/.deja-cdp-port`.
 
 ## hCaptcha solver (opt-in, cloud)
 

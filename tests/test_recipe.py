@@ -274,7 +274,9 @@ class VerifyOutputTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "t1.json"
             p.write_text(json.dumps(draft), encoding="utf-8")
-            with mock.patch.dict(sr.TIERS, tiers), mock.patch.object(sr, "_page_chars", return_value=page_chars):
+            # tiers the test does not give must fail without a browser (the real page/script tiers launch one)
+            stub = {t: (lambda *a: (500, "not under test")) for t in sr.TIERS}
+            with mock.patch.dict(sr.TIERS, {**stub, **tiers}),                     mock.patch.object(sr, "_page_chars", return_value=page_chars):
                 return sr.cmd_verify(str(p), {})
 
     def test_same_shape_preview_printed_once_and_capped(self):

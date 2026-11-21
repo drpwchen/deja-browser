@@ -52,7 +52,16 @@ class ConfigTest(unittest.TestCase):
             self.assertEqual(config.data_dir(), Path(td) / "deja-browser")
 
     def test_test_run_is_isolated_from_real_config(self):
-        self.assertEqual(config.CONFIG, {})
+        import conftest
+        self.assertEqual(config.CONFIG, {"browser": {"port": conftest.TEST_PORT}})
+        self.assertTrue(str(config.config_path()).startswith(conftest._TMP))
+
+    def test_test_browser_never_uses_9222(self):
+        import conftest
+        self.assertNotEqual(conftest.TEST_PORT, 9222)
+        self.assertEqual(browser.CONFIG_PORT, conftest.TEST_PORT)
+        self.assertNotIn("--remote-debugging-port=9222", browser.launch_args())
+        self.assertEqual(conftest.TEST_PREFIX, browser.TEST_PROFILE_PREFIX)
 
 
 class SecretStoreTest(unittest.TestCase):

@@ -521,6 +521,7 @@ class BatchTest(_FakeBrowserCase):
         self.assertIs(r["ok"], False)
         self.assertIn("error", r["results"][1])
         self.assertIn("timed out", r["results"][1]["error"])
+        self.assertEqual(r["results"][1]["data"], {"success": False, "waited_ms": 10})   # why, not just "failed"
 
     def test_wait_timeout_in_batch_continues_when_stop_on_error_false(self):
         steps = self.steps()
@@ -568,12 +569,14 @@ class LaunchTest(unittest.TestCase):
              mock.patch.object(ec.guard, "password_managers", return_value=[]), \
              mock.patch.object(ec.os.path, "exists", return_value=True), \
              mock.patch.object(ec.time, "sleep"), \
+             mock.patch.object(ec, "listener_pid", return_value=None), \
              mock.patch.object(ec.subprocess, "Popen") as popen:
             v, ours = ec.launch()
             self.assertTrue(ours)
             argv = popen.call_args[0][0]
             self.assertIn("--remote-debugging-address=127.0.0.1", argv)
-            self.assertIn("--remote-debugging-port=9222", argv)
+            self.assertIn(f"--remote-debugging-port={ec.PORT}", argv)
+            self.assertNotEqual(ec.PORT, 9222)              # tests run on a random port (conftest)
             self.assertIn("--no-first-run", argv)
             self.assertTrue(any(a.startswith("--user-data-dir=") and a.endswith("agent-profile") for a in argv))
 
@@ -797,6 +800,14 @@ class ProfileCheckTest(unittest.TestCase):
         with mock.patch.object(ec.config, "CONFIG", {"browser": {"check_profile": False}}),                 mock.patch.object(ec, "listener_pid", side_effect=AssertionError("no lookup")):
             ec.check_profile(self.V)
 
+    def test_foreign_browser_carries_pid_and_profile(self):
+        other = str(Path(self.td.name) / "other")
+        with mock.patch.object(ec, "listener_pid", return_value=42), \
+                mock.patch.object(ec, "_cmdline", return_value=f"msedge.exe --user-data-dir={other} --x"):
+            with self.assertRaises(ec.ForeignBrowser) as cm:
+                ec.check_profile(self.V)
+        self.assertEqual((cm.exception.pid, cm.exception.profile), (42, other))
+
     def test_user_data_dir_parsing(self):
         f = ec._user_data_dir
         self.assertEqual(f(r"edge --user-data-dir=C:\x\p --remote-debugging-port=9222"), r"C:\x\p")
@@ -805,6 +816,187 @@ class ProfileCheckTest(unittest.TestCase):
         self.assertEqual(f("chrome --user-data-dir=/Users/u/Library/Application Support/d/profile --remote-debugging-port=9222"),
                          "/Users/u/Library/Application Support/d/profile")
         self.assertIsNone(f("edge --remote-debugging-port=9222"))
+
+
+class PortTakenTest(unittest.TestCase):
+    """The configured port is held by another browser: our own orphaned test browser is closed and the
+    port reused; anything else is left running and the agent browser moves to a spare port, recorded
+    in the profile for later runs. Everything is mocked: nothing is killed, nothing launches."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.prof = Path(self.td.name) / "agent-profile"
+        self.prof.mkdir()
+        self.cfg_port = ec.CONFIG_PORT
+        self.spare = self.cfg_port + 1
+        self.saved_port = ec.PORT
+        self.up = {}                      # port -> /json/version of the browser listening there
+        self.owner = {}                   # port -> (pid, command line)
+        self.leftover = str(Path(tempfile.gettempdir()) / "deja-browser-test-abc123" / "data" / "profile")
+        self.patches = [
+            mock.patch.object(ec, "PROFILE", self.prof),
+            mock.patch.object(ec, "EDGE", "/fake/browser"),
+            mock.patch.object(ec.guard, "harden_profile"),
+            mock.patch.object(ec.guard, "password_managers", return_value=[]),
+            mock.patch.object(ec.os.path, "exists", return_value=True),
+            mock.patch.object(ec.time, "sleep"),
+            mock.patch.object(ec, "version", side_effect=lambda: self.up.get(ec.PORT)),
+            mock.patch.object(ec, "listener_pid", side_effect=lambda: (self.owner.get(ec.PORT) or (None,))[0]),
+            mock.patch.object(ec, "_cmdline", side_effect=self._cmdline),
+            mock.patch.object(ec, "_port_free", side_effect=lambda p: p not in self.owner),
+        ]
+        for p in self.patches:
+            p.start()
+        self.popen = mock.patch.object(ec.subprocess, "Popen", side_effect=self._start).start()
+        self.kill = mock.patch.object(ec, "_kill_tree", side_effect=self._kill).start()
+
+    def tearDown(self):
+        mock.patch.stopall()
+        for p in self.patches:
+            try:
+                p.stop()
+            except RuntimeError:
+                pass
+        ec._use_port(self.saved_port)
+        self.td.cleanup()
+
+    # fake process table
+    def _cmdline(self, pid):
+        return next((cl for p, cl in self.owner.values() if p == pid), "")
+
+    def _browser(self, port, pid, profile, bid):
+        self.owner[port] = (pid, f'msedge.exe --user-data-dir="{profile}" --remote-debugging-port={port}')
+        self.up[port] = {"Browser": "Edg/156", "webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/browser/{bid}"}
+
+    def _start(self, argv, **kw):
+        port = int(next(a for a in argv if a.startswith("--remote-debugging-port=")).split("=")[1])
+        self._browser(port, 900, self.prof, "agent-id")
+
+    def _kill(self, pid):
+        for port, (p, _) in list(self.owner.items()):
+            if p == pid:
+                del self.owner[port]
+                self.up.pop(port, None)
+        return True
+
+    def launched_port(self):
+        argv = self.popen.call_args[0][0]
+        return int(next(a for a in argv if a.startswith("--remote-debugging-port=")).split("=")[1])
+
+    # cases
+    def test_orphaned_test_browser_is_closed_and_the_port_reused(self):
+        self._browser(self.cfg_port, 4652, self.leftover, "test-id")
+        with mock.patch.object(ec, "_parent_state", return_value=("dead", "")):
+            v, ours = ec.launch()
+        self.kill.assert_called_once_with(4652)
+        self.assertTrue(ours)
+        self.assertEqual((self.launched_port(), ec.PORT), (self.cfg_port, self.cfg_port))
+        self.assertFalse((self.prof / ec.PORT_FILE).exists())
+
+    def test_test_browser_with_a_live_test_runner_is_not_killed(self):
+        self._browser(self.cfg_port, 4652, self.leftover, "test-id")
+        with mock.patch.object(ec, "_parent_state", return_value=("alive", "python.exe -m pytest -q")):
+            ec.launch()
+        self.kill.assert_not_called()
+        self.assertEqual(self.launched_port(), self.spare)
+
+    def test_unknown_parent_is_not_killed(self):
+        self._browser(self.cfg_port, 4652, self.leftover, "test-id")
+        with mock.patch.object(ec, "_parent_state", return_value=(None, "")):
+            ec.launch()
+        self.kill.assert_not_called()
+        self.assertEqual(self.launched_port(), self.spare)
+
+    def test_unknown_browser_is_left_alone_and_the_agent_moves_to_a_spare_port(self):
+        self._browser(self.cfg_port, 777, r"D:\Profiles\Microsoft\Edge\User Data", "user-id")
+        with mock.patch.object(ec, "_parent_state", side_effect=AssertionError("not a test profile: no lookup")):
+            v, ours = ec.launch()
+        self.kill.assert_not_called()
+        self.assertTrue(ours)
+        self.assertEqual((self.launched_port(), ec.PORT), (self.spare, self.spare))
+        self.assertEqual(ec.ENDPOINT, f"http://127.0.0.1:{self.spare}")
+        self.assertEqual((self.prof / ec.PORT_FILE).read_text(encoding="utf-8"), str(self.spare))
+        self.assertIn(self.cfg_port, self.owner)                 # the other browser still runs
+
+    def test_spare_port_skips_ports_already_in_use(self):
+        self._browser(self.cfg_port, 777, "/home/u/.config/chrome", "user-id")
+        self.owner[self.spare] = (555, "nginx")
+        ec.launch()
+        self.assertEqual(self.launched_port(), self.spare + 1)
+
+    def test_non_cdp_process_on_the_port_is_left_alone(self):
+        self.owner[self.cfg_port] = (555, "some-server --listen")   # holds the port, no /json/version
+        ec.launch()
+        self.kill.assert_not_called()
+        self.assertEqual(self.launched_port(), self.spare)
+
+    def test_later_run_reuses_the_recorded_spare_port(self):
+        self._browser(self.cfg_port, 777, "/home/u/.config/chrome", "user-id")
+        ec.launch()
+        self.popen.reset_mock()
+        ec._use_port(self.cfg_port)                              # a fresh process starts on the config port
+        v, ours = ec.launch()
+        self.assertFalse(ours)
+        self.popen.assert_not_called()
+        self.assertEqual(ec.PORT, self.spare)
+
+    def test_stale_spare_port_record_is_dropped(self):
+        (self.prof / ec.PORT_FILE).write_text(str(self.spare), encoding="utf-8")   # nothing runs there
+        ec.launch()
+        self.assertEqual(self.launched_port(), self.cfg_port)
+        self.assertFalse((self.prof / ec.PORT_FILE).exists())
+
+    def test_kill_that_does_not_free_the_port_falls_back_to_a_spare_port(self):
+        self._browser(self.cfg_port, 4652, self.leftover, "test-id")
+        self.kill.side_effect = lambda pid: True                 # "killed" but the port stays taken
+        with mock.patch.object(ec, "_parent_state", return_value=("dead", "")), \
+                mock.patch.object(ec, "_wait_port_free", return_value=False):
+            ec.launch()
+        self.assertEqual(self.launched_port(), self.spare)
+
+    def test_fast_path_has_no_process_lookup(self):
+        self._browser(self.cfg_port, 900, self.prof, "agent-id")
+        (self.prof / ec.ID_FILE).write_text("agent-id", encoding="utf-8")
+        with mock.patch.object(ec, "listener_pid", side_effect=AssertionError("no lookup")), \
+                mock.patch.object(ec, "_cmdline", side_effect=AssertionError("no lookup")):
+            self.assertEqual(ec.launch()[1], False)
+        self.popen.assert_not_called()
+
+    def test_stop_finds_the_agent_on_its_spare_port(self):
+        self._browser(self.cfg_port, 777, "/home/u/.config/chrome", "user-id")
+        ec.launch()
+        ec._use_port(self.cfg_port)
+        with mock.patch.object(ec.subprocess, "run") as run, mock.patch.object(ec.os, "kill") as kill:
+            run.return_value = mock.Mock(returncode=0)
+            r = ec.stop()
+        self.assertEqual(r["killed"], 900)                       # the agent browser, not pid 777
+
+
+class TestLeftoverTest(unittest.TestCase):
+    TMP = Path(tempfile.gettempdir())
+
+    def test_only_temp_dirs_named_by_our_test_suite(self):
+        f = ec.is_test_leftover
+        self.assertTrue(f(str(self.TMP / "deja-browser-test-3na8yxbl" / "data" / "profile")))
+        self.assertFalse(f(str(self.TMP / "some-other-tool" / "profile")))
+        self.assertFalse(f(str(Path.home() / "deja-browser-test-x" / "profile")))   # not under temp
+        self.assertFalse(f("/opt/deja-browser-test-x/profile"))
+        self.assertFalse(f(None))
+
+    def test_the_agent_profile_is_never_a_leftover(self):
+        prof = self.TMP / "deja-browser-test-y" / "data" / "profile"
+        with mock.patch.object(ec, "PROFILE", prof):
+            self.assertFalse(ec.is_test_leftover(str(prof)))
+
+    def test_orphan_rules(self):
+        lo = str(self.TMP / "deja-browser-test-z" / "profile")
+        cases = [(("dead", ""), True), ((None, ""), False), (("alive", "C:\\Python\\python.exe -m pytest"), False),
+                 (("alive", "/sbin/init"), True)]
+        for state, want in cases:
+            with mock.patch.object(ec, "_parent_state", return_value=state):
+                self.assertEqual(ec.is_orphaned_test_browser(1, lo), want, state)
+        with mock.patch.object(ec, "_parent_state", side_effect=AssertionError("no lookup")):
+            self.assertFalse(ec.is_orphaned_test_browser(1, r"D:\Profiles\Edge\User Data"))
 
 
 if __name__ == "__main__":

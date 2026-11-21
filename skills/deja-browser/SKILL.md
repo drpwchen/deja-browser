@@ -28,6 +28,7 @@ task, also after a failure: `deja-cdp close_session '{}' --session <task-name>`.
 | `wait` | `{text}` or `{selector, state}` or `{js}`, plus `timeout` (default 15000) — `{success, waited_ms}`; a timeout is `success: false`, not an error |
 | `batch` | `{steps: [{action, args, quiet}], stop_on_error}` — several actions in one call, see below |
 | `network_capture` | `{trigger, url_filter, types, wait_ms, body_dir}` — the requests one trigger causes |
+| `captcha_text` | `{image, input, submit, ok, fields, case, length, refresh, tries}` — text-in-an-image CAPTCHA (offline `ddddocr`), see below |
 | `screenshot` / `save_as_pdf` | `{path, ...}` — returns the file path, not the image |
 | `list_tabs`, `find_tab`, `attach_tab`, `cdp`, `close_session` | see `deja-cdp --help` |
 
@@ -46,6 +47,20 @@ deja-cdp batch '{"steps":[
 The result is `{ok, results:[{action, ok, data | error, secs}]}`. A failed step (an error, or a `wait` that timed out) stops the batch and
 marks the rest `skipped` (`"stop_on_error": false` keeps going); `quiet: true` drops a successful
 step's payload; batches cannot be nested; each step goes through the same host guard as a single call.
+
+Text-in-an-image CAPTCHA on a login form: use `captcha_text`, never a `screenshot` you OCR
+yourself. It reads the image's own pixels (an element screenshot is often cropped or rescaled),
+re-reads an answer of the wrong length before sending it, and tries the code as read, then upper
+case, then lower case. A rejected submit usually reloads the form empty, so pass the other fields
+in `fields` — they are refilled on every attempt and never echoed back:
+
+```bash
+deja-cdp captcha_text '{"image":"img.captcha","input":"#code","submit":"#login",
+  "ok":"!document.querySelector(\"#password\")","fields":{"#user":"…","#password":"…"}}' --session lib
+```
+
+`ok` is a JS expression that is true once the site accepted the code. Without `submit` it only
+reads and fills (`{code, plausible, source, …}`). In Python: `recipe.solve_image_captcha(page, …)`.
 
 ## Cheapest first
 

@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.3.0] — 2026-11-21
+
+### Added
+- `captcha_text` action: `{image, input, submit, ok, fields, case, length, refresh, tries}` solves a text-in-an-image CAPTCHA with local `ddddocr`. Without `submit` it reads and fills the code; with `submit` it also submits and retries until the JS expression `ok` is true, refilling `fields` (`{selector: value}`, never echoed back) on each attempt, because a rejected submit usually reloads the form empty.
+
+### Changed
+- Text CAPTCHAs (`captcha_text` and `recipe.solve_image_captcha`) now read the image's own pixels through a canvas at its natural size instead of an element screenshot, which could be cropped or rescaled (a 4-character code was read as 3). An element screenshot is only the fallback for a cross-origin image. When the length is known (the input's `maxlength` or `length`), a wrong-length read is refreshed and read again instead of being submitted. Unless `case` is given, attempts try the code as read, then upper case, then lower case (`ddddocr` answers in lower case; some sites compare case-sensitively). `solve_image_captcha` takes the new `case`, `length`, `refresh_selector` and `fields` arguments; existing calls keep working.
+- `batch`: a step that ran but returned `success: false` keeps its `data` next to the `error`, so the reason is visible.
+- When the CDP port is taken by another browser, `deja-cdp` no longer stops with an error. A browser left behind by deja-browser's own test suite (profile in a temp `deja-browser-test-*` directory whose test run has ended) is closed and the port reused; any other browser is left running and the agent browser starts on the next free port after `port`, recorded in `<profile>/.deja-cdp-port` so later runs (and `deja-cdp status` / `stop`) find it. A stale record is dropped. `deja-cdp launch` / `status` print the port in use.
+
+### Fixed
+- The test suite no longer starts a real browser: three `verify` tests ran the real page/script tiers, which launched a browser on port 9222 and could leave it running after the tests ended. Tests now use a random port (never 9222), fail if a test tries to start a browser, and close any browser on a test profile when the run ends.
+
 ## [0.2.0] — 2026-11-20
 
 ### Added

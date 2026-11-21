@@ -8,7 +8,8 @@
 # executable = "C:/Program Files/Google/Chrome/Application/chrome.exe"   # default: first of Edge/Chrome/Chromium/Brave
 # profile = "~/.deja-browser-profile"     # dedicated user-data-dir; default <data dir>/profile
 # sessions_file = "~/.deja-browser-sessions.json"
-# port = 9222                             # CDP, always bound to 127.0.0.1
+# port = 9222                             # CDP, always bound to 127.0.0.1; if another browser holds it,
+#                                         # the agent browser moves to the next free port (see README)
 # check_profile = true                   # refuse a browser already on `port` that runs another profile
 #                                         # (checked once per browser start; later connects are free)
 # password_manager = false               # default: on every launch, turn OFF the profile's password,

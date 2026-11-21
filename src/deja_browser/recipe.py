@@ -422,27 +422,16 @@ def solve_recaptcha_audio(page, tries=3):
 
 
 def solve_image_captcha(page, image_selector, input_selector, digits_only=False, tries=6, submit_selector=None,
-                        ok_check=None):
+                        ok_check=None, case=None, length=None, refresh_selector=None, fields=None):
     """Classic text-in-an-image CAPTCHA (library proxy, NDLTD style): offline ddddocr, retry on a miss.
-    Same engine as paper-fetch library_session.solve_captcha / ndltd. -> attempts used, or 0 on failure."""
-    import ddddocr
-    ocr = ddddocr.DdddOcr(show_ad=False)
-    for i in range(1, tries + 1):
-        png = page.locator(image_selector).first.screenshot()
-        code = ocr.classification(png)
-        code = re.sub(r"\D", "", code) if digits_only else re.sub(r"[^0-9A-Za-z]", "", code)
-        page.fill(input_selector, code, timeout=5000)
-        if not submit_selector:
-            return i
-        page.locator(submit_selector).first.click(timeout=8000)
-        page.wait_for_timeout(2500)
-        if ok_check is None or page.evaluate(ok_check):
-            return i
-        try:   # most sites swap the image on a miss; click it to force a fresh one if not
-            page.locator(image_selector).first.click(timeout=2000)
-        except Exception:
-            pass
-    return 0
+    Reads the image's own pixels (not an element screenshot), re-reads wrong-length answers before
+    submitting, rotates letter case across attempts unless `case` is given. See textcaptcha.py.
+    -> attempts used, or 0 on failure."""
+    from . import textcaptcha
+    r = textcaptcha.solve(page, image_selector, input_selector, case=case, digits_only=digits_only,
+                          length=length, tries=tries, submit_selector=submit_selector, ok_check=ok_check,
+                          refresh_selector=refresh_selector, fields=fields)
+    return 0 if r["solved"] is False else r["attempts"]
 
 
 def ntfy(title, message):

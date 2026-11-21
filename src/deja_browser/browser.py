@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 """Kimi-WebBridge-compatible `wb(action, args)` on a dedicated agent browser over CDP.
 
-  Dedicated profile ([browser] profile, default <data dir>/profile), CDP on 127.0.0.1:9222 only.
+  Dedicated profile ([browser] profile, default <data dir>/profile), CDP on 127.0.0.1 only, port
+  [browser] port (default 9222). If that port is taken by another browser, launch() never hands it out:
+  a browser left over by this project's own test suite (profile in a temp deja-browser-test-* dir, its
+  test runner gone) is closed; anything else is left alone and the agent browser starts on the first
+  free port after it, recorded in <profile>/.deja-cdp-port so later runs find it.
   Never touches the user's everyday browser profile. Any Chromium browser works: [browser]
   executable / env DEJA_BROWSER_BROWSER, else the first of Edge, Chrome, Chromium, Brave found on
   this machine. Started on demand and left running afterwards — close_session only closes this
@@ -53,7 +57,7 @@ Driver: playwright (default) or patchright (EDGE_CDP_DRIVER=patchright or use_dr
 CLI:
   deja-cdp launch                     start the agent browser (e.g. to log in to a site by hand once)
   deja-cdp status                     is CDP up? which version?
-  deja-cdp stop                       kill ONLY the agent-profile browser (refuses any other 9222 owner)
+  deja-cdp stop                       kill ONLY the agent-profile browser (refuses any other port owner)
   deja-cdp <action> '<json args>' [--session S]
   deja-cdp batch '{"steps":[{"action":"navigate","args":{"url":"https://example.com"},"quiet":true},
                             {"action":"wait","args":{"text":"Example"}},
@@ -90,9 +94,19 @@ def find_browser():
 EDGE = find_browser()
 PROFILE = config.path("browser", "profile", config.data_dir() / "profile")
 SESSIONS_FILE = config.path("browser", "sessions_file", config.data_dir() / "sessions.json")
-PORT = int(config.get("browser", "port", 9222))
+CONFIG_PORT = int(config.get("browser", "port", 9222))
+PORT = CONFIG_PORT          # the port in effect: CONFIG_PORT, or the spare one recorded in PROFILE/PORT_FILE
 ENDPOINT = f"http://127.0.0.1:{PORT}"
 SHOT_DIR = Path(tempfile.gettempdir()) / "deja-cdp"
+PORT_FILE = ".deja-cdp-port"                  # in PROFILE: spare port the agent browser moved to
+TEST_PROFILE_PREFIX = "deja-browser-test-"    # temp dirs made by this project's own test suite
+SPARE_PORTS = 50                              # spare port = first free one in CONFIG_PORT+1 .. +SPARE_PORTS
+
+
+def _use_port(port):
+    global PORT, ENDPOINT
+    PORT = int(port)
+    ENDPOINT = f"http://127.0.0.1:{PORT}"
 
 
 def launch_args():
@@ -106,6 +120,14 @@ class WbError(RuntimeError):
 
 class NoTab(WbError):
     """The session has no live tab (never opened, or closed by the user / an Edge restart)."""
+
+
+class ForeignBrowser(WbError):
+    """PORT is held by a browser on another profile (pid, profile = its process id and --user-data-dir)."""
+
+    def __init__(self, msg, pid=None, profile=None):
+        super().__init__(msg)
+        self.pid, self.profile = pid, profile
 
 
 # ---------- the browser process ----------
@@ -172,17 +194,181 @@ def check_profile(v):
     if other is None:
         return   # cannot tell (no permission, unusual platform): do not block, do not record
     if not _same_dir(other, PROFILE):
-        raise WbError(f"port {PORT} is held by a browser on another profile ({other}), not the agent "
-                      f"profile {PROFILE}. Close that browser, or use another [browser] port.")
+        raise ForeignBrowser(f"port {PORT} is held by a browser on another profile ({other}), not the agent "
+                             f"profile {PROFILE}. Close that browser, or use another [browser] port.",
+                             pid=pid, profile=other)
     _remember(bid)
 
 
-def launch(timeout=20, url="about:blank"):
-    """Start headed Edge on the agent profile unless CDP is already up. -> (version_json, launched_by_us)."""
+# ---------- the port is taken: whose browser is it? ----------
+
+def _saved_port():
+    try:
+        return int((PROFILE / PORT_FILE).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _save_port():
+    try:
+        if PORT == CONFIG_PORT:
+            (PROFILE / PORT_FILE).unlink(missing_ok=True)
+        else:
+            (PROFILE / PORT_FILE).write_text(str(PORT), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _adopt_saved_port():
+    """If an earlier launch moved the agent browser to a spare port (PROFILE/PORT_FILE) and it still runs
+    there, use that port. A stale record (nothing there, or not our profile) is deleted. No file: one stat."""
+    saved = _saved_port()
+    if saved is None or saved == PORT:
+        return
+    old = PORT
+    _use_port(saved)
     v = version()
     if v:
-        check_profile(v)
-        return v, False
+        try:
+            check_profile(v)
+            return
+        except WbError:
+            pass
+    _use_port(old)
+    try:
+        (PROFILE / PORT_FILE).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def is_test_leftover(profile):
+    """True only for a profile this project's test suite made: under the system temp dir, inside a
+    directory named TEST_PROFILE_PREFIX*. Never the agent PROFILE."""
+    if not profile or _same_dir(profile, PROFILE):
+        return False
+    p = Path(os.path.abspath(profile))
+    tmp = Path(os.path.abspath(tempfile.gettempdir()))
+    try:
+        rel = p.relative_to(tmp) if os.name != "nt" else Path(os.path.normcase(str(p))).relative_to(
+            Path(os.path.normcase(str(tmp))))
+    except ValueError:
+        return False
+    return any(part.startswith(TEST_PROFILE_PREFIX) for part in rel.parts)
+
+
+def _parent_state(pid):
+    """-> ("alive", parent command line) | ("dead", "") | (None, "") when it can not be told.
+    A parent counts only if it started before the child (a recycled PID is not the parent)."""
+    try:
+        if os.name == "nt":
+            ps = (f"$c = Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}'; "
+                  "if (-not $c) { 'UNKNOWN'; exit }; "
+                  "$p = Get-CimInstance Win32_Process -Filter \"ProcessId=$($c.ParentProcessId)\"; "
+                  "if ($p -and $p.CreationDate -le $c.CreationDate) { \"ALIVE`t$($p.CommandLine)\" } else { 'DEAD' }")
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True,
+                                 timeout=20).stdout.strip()
+        else:
+            ppid = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True,
+                                  timeout=10).stdout.strip()
+            if not ppid.isdigit():
+                return None, ""
+            if int(ppid) <= 1:
+                return "dead", ""
+            def ps(field, p):
+                return subprocess.run(["ps", "-o", f"{field}=", "-p", str(p)], capture_output=True, text=True,
+                                      timeout=10).stdout.strip()
+            pcl = ps("command", ppid)
+            if not pcl:
+                return "dead", ""
+            child_age, parent_age = ps("etimes", pid), ps("etimes", ppid)
+            older = not (child_age.isdigit() and parent_age.isdigit()) or int(parent_age) >= int(child_age)
+            out = "ALIVE\t" + pcl if older else "DEAD"
+    except Exception:
+        return None, ""
+    if out.startswith("ALIVE"):
+        return "alive", out.partition("\t")[2]
+    if out == "DEAD":
+        return "dead", ""
+    return None, ""
+
+
+def is_orphaned_test_browser(pid, profile):
+    """A browser our own test suite started whose test runner is gone: safe to kill. Anything we can not
+    be sure about (unknown parent, a live python parent = a test still running) is False."""
+    if not is_test_leftover(profile):
+        return False
+    state, parent = _parent_state(pid)
+    if state == "dead":
+        return True
+    return state == "alive" and "python" not in parent.lower() and "pytest" not in parent.lower()
+
+
+def _kill_tree(pid):
+    if os.name == "nt":
+        return subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True).returncode == 0
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except OSError:
+        return False
+
+
+def _wait_port_free(timeout=10):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if listener_pid() is None:
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def _port_free(port):
+    import socket
+    with socket.socket() as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def _spare_port():
+    for p in range(CONFIG_PORT + 1, CONFIG_PORT + 1 + SPARE_PORTS):
+        if _port_free(p):
+            return p
+    raise WbError(f"port {CONFIG_PORT} is taken and no free port in {CONFIG_PORT + 1}-{CONFIG_PORT + SPARE_PORTS}")
+
+
+def _clear_port(why, pid=None, profile=None):
+    """PORT is held by something that is not the agent browser. A browser left over by our own tests is
+    killed and PORT reused; anything else is left alone and the agent browser moves to a spare port."""
+    if pid and is_orphaned_test_browser(pid, profile):
+        print(f"deja-cdp: port {PORT} held by a leftover deja-browser test browser (pid {pid}, {profile}); "
+              "closing it", file=sys.stderr)
+        if _kill_tree(pid) and _wait_port_free():
+            return
+    spare = _spare_port()
+    print(f"deja-cdp: port {PORT} is {why}; leaving it alone and starting the agent browser on port {spare}",
+          file=sys.stderr)
+    _use_port(spare)
+
+
+def launch(timeout=20, url="about:blank"):
+    """Start headed Edge on the agent profile unless CDP is already up. -> (version_json, launched_by_us).
+    If PORT is taken by another browser: our own orphaned test browser is closed; anything else is left
+    running and the agent browser starts on a spare port, recorded in PROFILE/PORT_FILE for later runs."""
+    _adopt_saved_port()
+    v = version()
+    if v:
+        try:
+            check_profile(v)
+            return v, False
+        except ForeignBrowser as ex:
+            _clear_port(f"held by a browser on another profile ({ex.profile})", ex.pid, ex.profile)
+    else:
+        pid = listener_pid()
+        if pid is not None:
+            _clear_port(f"held by a non-CDP process (pid {pid})", pid, _user_data_dir(_cmdline(pid)) or None)
     if not EDGE or not os.path.exists(EDGE):
         raise WbError(f"no Chromium browser found ({EDGE or 'none detected'}); "
                       f"set [browser] executable in {config.config_path()}")
@@ -201,8 +387,15 @@ def launch(timeout=20, url="about:blank"):
         v = version()
         if v:
             _remember(_browser_id(v))   # we started it on PROFILE: no lookup needed later
+            _save_port()                # spare port recorded for later runs; back on CONFIG_PORT: record removed
             return v, True
         time.sleep(0.5)
+    # another process may have started the agent browser on a spare port meanwhile (our start was then
+    # handed to that browser, which stays on its own port): look where the record says
+    port = PORT
+    _adopt_saved_port()
+    if PORT != port and (v := version()):
+        return v, False
     raise WbError(f"CDP endpoint {ENDPOINT} not up after {timeout}s")
 
 
@@ -227,6 +420,7 @@ def _cmdline(pid):
 
 def stop():
     """Kill only the agent-profile browser (the PID owning PORT, if its command line names PROFILE)."""
+    _adopt_saved_port()
     pid = listener_pid()
     if pid is None:
         return {"killed": None, "reason": f"no listener on {PORT}"}
@@ -827,12 +1021,44 @@ def _batch(ctx, session, a):
         secs = round(time.monotonic() - t0, 3)
         if err is not None:
             failed = True
-            results.append({"action": act, "ok": False, "error": err, "secs": secs})
+            row = {"action": act, "ok": False, "error": err, "secs": secs}
+            if data is not None:   # success:false still says why (e.g. captcha_text attempts / last read)
+                row["data"] = data
+            results.append(row)
         elif s.get("quiet"):
             results.append({"ok": True, "secs": secs})
         else:
             results.append({"action": act, "ok": True, "data": data, "secs": secs})
     return {"ok": not failed, "results": results}
+
+
+def _captcha_text(page, a):
+    """Text-image CAPTCHA, offline ddddocr. Reads the image's own pixels (an element screenshot gets
+    cropped/rescaled), re-reads a wrong-length answer, fills `input`. With `submit` (+ `ok`, a JS
+    expression that is truthy once accepted) it also submits and retries up to `tries` times,
+    refilling `fields` ({selector: value}) each time; their values are never echoed back."""
+    from . import textcaptcha
+    img = a.get("image")
+    if not img:
+        raise WbError("captcha_text: image (selector of the CAPTCHA <img>) required")
+    kw = dict(case=a.get("case"), digits_only=bool(a.get("digits_only")), length=a.get("length"),
+              refresh_selector=a.get("refresh"))
+    if kw["case"] not in (None, "upper", "lower"):
+        raise WbError("captcha_text: case must be upper, lower or omitted")
+    try:
+        if a.get("submit"):
+            if not a.get("input"):
+                raise WbError("captcha_text: submit needs input")
+            r = textcaptcha.solve(page, img, a["input"], tries=int(a.get("tries", 6)),
+                                  submit_selector=a["submit"], ok_check=a.get("ok"),
+                                  fields=a.get("fields"), **kw)
+            return {"success": bool(r["solved"]), **r}
+        r = textcaptcha.read_code(page, img, a.get("input"), **kw)
+    except RuntimeError as ex:
+        raise WbError(f"captcha_text: {ex}")
+    if a.get("input"):
+        page.fill(a["input"], r["code"], timeout=5000)
+    return {"success": r["plausible"], "filled": bool(a.get("input")), **r}
 
 
 SESSION_ACTIONS = {"navigate": _navigate, "network_capture": _network_capture_action,
@@ -841,7 +1067,7 @@ SESSION_ACTIONS = {"navigate": _navigate, "network_capture": _network_capture_ac
                    "batch": _batch}
 PAGE_ACTIONS = {"evaluate": _evaluate, "fill": _fill, "click": _click, "screenshot": _screenshot,
                 "save_as_pdf": _save_as_pdf, "snapshot": _snapshot, "cdp": _cdp, "wait": _wait,
-                "read": _read}
+                "read": _read, "captcha_text": _captcha_text}
 
 
 def wb(action, args=None, session="default"):
@@ -867,10 +1093,11 @@ def main(argv=None):
     cmd = argv[0]
     if cmd == "launch":
         v, ours = launch()
-        out = {"browser": v.get("Browser"), "launched": ours, "profile": str(PROFILE)}
+        out = {"browser": v.get("Browser"), "launched": ours, "profile": str(PROFILE), "port": PORT}
     elif cmd == "status":
+        _adopt_saved_port()
         v = version()
-        out = {"up": bool(v), "browser": (v or {}).get("Browser"), "profile": str(PROFILE)}
+        out = {"up": bool(v), "browser": (v or {}).get("Browser"), "profile": str(PROFILE), "port": PORT}
     elif cmd == "stop":
         out = stop()
     else:

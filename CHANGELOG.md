@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] — 2026-11-22
+
+### Testing
+- A test's made-up API key is now an obviously fake low-entropy string: the repository's secret scan (gitleaks, `generic-api-key`) flagged the one in 0.4.0. It was never a real key. No code changes.
+
 ## [0.4.0] — 2026-11-22
 
 This release targets two things: a first visit that costs the model less (a warm daemon, element refs, one `learn` call instead of draft / verify by hand), and pages from older systems (dialogs, frames, popups, `<select>`, flows with no JSON API, a step only a human can do).

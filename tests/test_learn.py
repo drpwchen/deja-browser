@@ -402,13 +402,13 @@ class PlanApiTest(unittest.TestCase):
             self.assertIn("'v9.9.99'", cm.exception.reason)
 
     def test_config_values_and_kept_keys_are_not_derived(self):
-        self.r.resp("https://app.test/?q=rust", '<script>cfg={appId:"APP12345",key:"0123456789abcdef0123"}</script>'
-                    .replace("APP12345", '"APP12345"').replace("0123456789abcdef0123", '"0123456789abcdef0123"'),
+        self.r.resp("https://app.test/?q=rust", '<script>cfg={appId:"APP12345",key:"aaaa1111bbbb2222cccc"}</script>'
+                    .replace("APP12345", '"APP12345"').replace("aaaa1111bbbb2222cccc", '"aaaa1111bbbb2222cccc"'),
                     mime="text/html", rtype="document")
-        self.r.resp("https://x-dsn.search.test/1/query?application-id=APP12345&api-key=0123456789abcdef0123",
+        self.r.resp("https://x-dsn.search.test/1/query?application-id=APP12345&api-key=aaaa1111bbbb2222cccc",
                     _hits(), method="POST", post='{"query": "rust"}')
         plan, rep = learn.plan_api(self.r.data(), [TITLES[0]], {}, keep=["api-key"], name="s")
-        self.assertIn("api-key=0123456789abcdef0123", plan["draft"]["request"]["url"])
+        self.assertIn("api-key=aaaa1111bbbb2222cccc", plan["draft"]["request"]["url"])
         self.assertFalse(plan["draft"]["writes"])                 # POST to .../query: a read
         plan2, rep2 = learn.plan_api(self.r.data(), [TITLES[0]], {}, name="s")
         self.assertEqual(rep2["dropped"], ["api-key"])

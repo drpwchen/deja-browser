@@ -80,9 +80,10 @@ deja-cdp <action> '<json args>' --session <task-name>
   max_chars: 3000}`, act on the refs (`click {selector: "@e5"}`, `fill`, `select`, with
   `then_snapshot: true`), and finish with one small `evaluate {code}` that returns just the answer.
   Screenshots and PDFs go to a `path`; read the file only if you must.
-- If the task will come back: `deja-browser learn --name <name> --session <task-name> --expect
-  "<a value from the answer>"` before `close_session`. It drafts, verifies and saves the recipe in
-  one call; on `ok: false` follow its `hint`. `--expect` is text from the answer, not a field name.
+- `close_session` learns the visit by itself when the host has no recipe yet (`learned` in its
+  reply). To choose the name or the check values, run `deja-browser learn --name <name> --session
+  <task-name> --expect "<a value from the answer>"` before `close_session`; on `ok: false` follow
+  its `hint`. `--expect` is text from the answer, not a field name.
 - A *stale* run means the site changed: do the task by hand once, then `learn` again (`--force`).
   Never patch a recipe mid-run. `deja-cdp help <action>` / `deja-browser help <command>` give
   the details.

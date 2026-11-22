@@ -871,3 +871,158 @@ def compact(obj, limit=400):
     if len(s) > limit and isinstance(obj.get("params"), dict):
         obj["params"] = sorted(obj["params"])
     return obj
+
+
+# ---------- auto-learn at close_session ----------
+#
+# WHY (0.4.2; on by default): before 0.4.2 a recipe was
+# saved only when the agent remembered to call `learn` before `close_session`, which clears the recording;
+# a forgotten learn threw the visit away. `deja-cdp close_session` now runs learn itself first. Without an
+# agent to judge, it is stricter than a manual learn: it never passes --write, it skips a visit that sent
+# any request that may change something (not only the requests of the flow it would save), a visit that
+# typed into a password field or handed the tab to a human, and a host that already has a recipe. The
+# answer it verifies against (--expect) is taken from the visit's last read / evaluate result: values the
+# agent itself extracted, minus the values it typed or navigated with (a replay that echoes its input
+# back would prove nothing). learn's own verify then decides: nothing is saved unless a replay with the
+# recorded values reproduces them.
+
+AUTO_SKIP_SESSIONS = ("recipe-", "learn-")
+AUTO_MAX_EXPECTS = 2
+AUTO_MAX_EXPECT_LEN = 40
+_AUTO_NAME_BAD = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+_AUTO_READ_TOKENS = {"search", "query", "queries", "filter", "filters", "find", "list", "lookup", "suggest",
+                     "suggestions", "autocomplete", "browse", "facet", "facets", "graphql"}
+_AUTO_WRITE_TOKENS = {"add", "create", "new", "update", "edit", "delete", "remove", "save", "submit", "complete",
+                      "post", "send", "buy", "order", "orders", "checkout", "cart", "pay", "payment", "vote", "like",
+                      "follow", "subscribe", "unsubscribe", "register", "signup", "login", "logout", "upload",
+                      "comment", "reply", "book", "booking", "reserve", "confirm", "cancel", "set", "mutation"}
+
+
+def auto_read(request):
+    """looks_read for auto-learn, where no agent judges the visit: a non-GET counts as a read only when a
+    WHOLE word of its URL path is a read word (search, query, filter, list ...) and none is a write word
+    (add, save, submit, complete, order ...); on a GraphQL path the body must hold a query that is not a
+    mutation (a persisted query or a cut-off body counts as a write). It can only judge what was recorded:
+    a cross-site xhr / fetch that does not return JSON, and beacons, are not (recording.py).
+    "/wishlist/add", "/checklist/complete" and {"query": "..."} posted to "/api/notes" are writes here."""
+    if (request.get("method") or "GET").upper() == "GET":
+        return True
+    path = urllib.parse.urlsplit(request.get("url", "")).path
+    words = {w.lower() for w in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])", path)}
+    if words & _AUTO_WRITE_TOKENS:
+        return False
+    if "graphql" in words:     # a persisted / cut-off body says nothing: only a visible query is a read
+        body = request.get("body")
+        q = body.get("query") if isinstance(body, dict) else None
+        return isinstance(q, str) and bool(q.strip()) and not q.lstrip().startswith("mutation")
+    return bool(words & _AUTO_READ_TOKENS)
+
+
+def _leaves(x, out, depth=0):
+    if depth > 12 or len(out) > 400:
+        return
+    if isinstance(x, dict):
+        for v in x.values():
+            _leaves(v, out, depth + 1)
+    elif isinstance(x, list):
+        for v in x:
+            _leaves(v, out, depth + 1)
+    elif isinstance(x, bool) or x is None or isinstance(x, float):
+        return
+    elif isinstance(x, int):
+        out.append(str(x))
+    elif isinstance(x, str):
+        s = x.strip()
+        if s[:1] in "[{":
+            try:
+                _leaves(json.loads(s), out, depth + 1)
+                return
+            except ValueError:
+                pass
+        out.extend(line.strip() for line in s.splitlines())
+
+
+def auto_expects(c, exclude=()):
+    """Up to AUTO_MAX_EXPECTS values from an extraction command's result, distinctive ones first (a digit,
+    then length), none of them one of `exclude` or inside one of them (typed values, navigated URLs)."""
+    if "result" in c:
+        raw = []
+        _leaves(c["result"], raw)
+    else:
+        raw = [line.strip() for line in (c.get("result_preview") or "").splitlines()]
+    seen, cands = set(), []
+    for i, v in enumerate(raw):
+        if len(v) > AUTO_MAX_EXPECT_LEN:
+            v = v[:AUTO_MAX_EXPECT_LEN].rstrip()
+        if len(v) < D.MIN_EXPECT or v in seen or not re.search(r"\w", v) or "<redacted" in v:
+            continue
+        seen.add(v)
+        if any(v == e or v in e for e in exclude):
+            continue
+        cands.append((-(bool(re.search(r"\d", v))), -(len(v) >= 6), i, v))
+    out = []
+    for *_, v in sorted(cands):
+        if any(v in o or o in v for o in out):
+            continue
+        out.append(v)
+        if len(out) == AUTO_MAX_EXPECTS:
+            break
+    return out
+
+
+def auto_name(session):
+    """A recipe name from the session's name: "booking-1029" -> "booking", "oe q1" -> "oe-q1"."""
+    n = _AUTO_NAME_BAD.sub("-", session or "").strip("-.").lower()
+    while True:
+        m = re.fullmatch(r"(.+?)[-_.]\d+", n)
+        if not m:
+            break
+        n = m.group(1)
+    n = n[:40].strip("-.")
+    return n if n and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", n) and not n.isdigit() else "auto"
+
+
+def auto_plan(rec, session):
+    """-> {"skip": reason} or {"name", "expects", "host"}: what close_session's auto-learn would run."""
+    if (session or "").startswith(AUTO_SKIP_SESSIONS):
+        return {"skip": "a recipe / learn session"}
+    cmds = rec.get("commands") or []
+    dropped = rec.get("dropped") or {}
+    if dropped.get("responses") or dropped.get("commands"):
+        return {"skip": "the visit was too long to keep whole (the recording dropped its oldest entries), so "
+                        "it can't be checked for requests that change something; learn by hand"}
+    for c in cmds:
+        a, args = c.get("action"), c.get("args") or {}
+        if a in ("handoff", "captcha_text"):
+            return {"skip": f"the visit used {a}"}
+        if a == "fill" and args.get("redacted"):
+            return {"skip": "the visit typed into a password field"}
+    for r in rec.get("responses") or []:
+        if (r.get("method") or "GET").upper() == "GET":
+            continue
+        body = r.get("post_data")
+        try:
+            body = json.loads(body) if isinstance(body, str) else body
+        except ValueError:
+            pass
+        if not auto_read({"method": r.get("method"), "url": r.get("url", ""), "body": body}):
+            return {"skip": f"the visit sent a {r.get('method')} that may change something "
+                            f"({D.clean_url(r.get('url', ''))[:80]}); if replaying it is safe, learn by hand "
+                            "with --write"}
+    ext = next((c for c in reversed(cmds) if c.get("action") in ("read", "evaluate") and c.get("ok")
+                and ("result" in c or c.get("result_preview"))), None)
+    if ext is None:
+        return {"skip": "no read / evaluate result to check a replay against"}
+    page = ext.get("url_after") or ext.get("url_before") or rec.get("url") or ""
+    host = urllib.parse.urlsplit(page).hostname
+    if not host:
+        return {"skip": "the page of the answer is unknown"}
+    exclude = [v for _, v, _ in candidate_list(rec)]
+    exclude += [(c.get("args") or {}).get("url") or "" for c in cmds if c.get("action") == "navigate"]
+    exclude = [urllib.parse.unquote(e) for e in exclude if e]
+    expects = auto_expects(ext, exclude)
+    if not expects:
+        return {"skip": "the last read / evaluate holds no value distinctive enough to check a replay"}
+    return {"name": auto_name(session), "expects": expects, "host": host}

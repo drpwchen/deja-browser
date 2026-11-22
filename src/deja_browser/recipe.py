@@ -403,6 +403,9 @@ def ntfy(title, message):
     notify.notify(title, message)
 
 
+HUMAN_WAIT = None    # set (0) by auto-learn: a verify at close_session never waits for a person
+
+
 def challenge_gate(page, human_wait=300):
     """-> {"challenge": kind|None, "cleared": bool, "how": ...}. Claude solves these itself; the
     human is the LAST resort.
@@ -415,6 +418,8 @@ def challenge_gate(page, human_wait=300):
       4. human — notify + wait, only when Google refuses audio ('automated queries') or all else fails
     reCAPTCHA v3 *score* failures are not a widget: give the recipe "driver": "patchright"
     (hides the Runtime.enable CDP signal)."""
+    if HUMAN_WAIT is not None:
+        human_wait = HUMAN_WAIT
     kind = challenge(page)
     if not kind and _widget_pending(page):
         kind = _wait_widget(page, 8)
@@ -1096,7 +1101,7 @@ def _verify_failure(kind, results, plan):
     return reason, hint
 
 
-def cmd_learn(argv):
+def cmd_learn(argv, recording=None):
     """`learn --name N --expect S … [--session S] [--param n=v …] [--keep-param K …] [--write] [--force]
     [--verbose]` -> (output dict, exit code). See learn.py for the rules."""
     import argparse
@@ -1132,15 +1137,18 @@ def cmd_learn(argv):
                            "capture the request with deja-cdp network_capture, then deja-browser draft", V), 1
     tmp = Path(tempfile.mkdtemp(prefix="deja-learn-"))
     try:
-        try:
-            rep = client.call_running("recording", {"body_dir": str(tmp)}, session=ns.session)
-        except (client.Unavailable, client.LostReply) as ex:
-            return _learn_fail(f"no recording to learn from ({ex})",
-                               "do the visit with deja-cdp (the daemon records it), then learn before close_session",
-                               V), 1
-        if not rep.get("ok"):
-            return _learn_fail(f"recording: {rep.get('error')}", "", V), 1
-        rec = rep["data"]
+        if recording is not None:          # auto-learn: fetched (bodies included) before close_session
+            rec = recording
+        else:
+            try:
+                rep = client.call_running("recording", {"body_dir": str(tmp)}, session=ns.session)
+            except (client.Unavailable, client.LostReply) as ex:
+                return _learn_fail(f"no recording to learn from ({ex})",
+                                   "do the visit with deja-cdp (the daemon records it), then learn before "
+                                   "close_session", V), 1
+            if not rep.get("ok"):
+                return _learn_fail(f"recording: {rep.get('error')}", "", V), 1
+            rec = rep["data"]
         if V is not None:
             V["recording"] = {"responses": len(rec.get("responses") or []), "commands": len(rec.get("commands") or []),
                               "url": rec.get("url")}
@@ -1226,6 +1234,89 @@ def cmd_learn(argv):
         return _learn_fail(*first_fail, V), 1
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def auto_enabled():
+    """[recipes] auto_learn (default true); DEJA_BROWSER_AUTO_LEARN=0 turns it off for one process."""
+    env = os.environ.get("DEJA_BROWSER_AUTO_LEARN")
+    if env is not None:
+        return env.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(config.get("recipes", "auto_learn", True))
+
+
+def auto_learn_prepare(session):
+    """BEFORE close_session (which clears the recording): fetch the recording, bodies into a temp dir, and
+    decide. -> None (nothing to say: off, no daemon, nothing recorded, a recipe / learn session),
+    {"result": {...}} (skipped), or {"session", "plan", "rec", "tmp"} for auto_learn_finish."""
+    import shutil
+    import tempfile
+    from . import client, learn
+    if not auto_enabled() or (session or "").startswith(learn.AUTO_SKIP_SESSIONS) or not client.enabled():
+        return None
+    def fetch(args):
+        try:
+            rep = client.call_running("recording", args, session=session)
+        except (client.Unavailable, client.LostReply):
+            return {}
+        return (rep.get("data") or {}) if rep.get("ok") else {}
+    rec = fetch({})                        # metadata only: nothing is written unless it will learn
+    if not rec.get("commands"):
+        return None
+    plan = learn.auto_plan(rec, session)
+    if "skip" not in plan:
+        hd = RECIPES / plan["host"]
+        have = sorted(x.stem for x in hd.glob("*.json")) if hd.is_dir() else []
+        if have:
+            plan = {"skip": f"{plan['host']} already has recipes ({', '.join(have[:5])}); learn by hand "
+                            "to add another"}
+    if "skip" in plan:
+        return {"result": {"ok": False, "skipped": plan["skip"][:200]}}
+    tmp = Path(tempfile.mkdtemp(prefix="deja-autolearn-"))
+    try:
+        rec = fetch({"body_dir": str(tmp)})
+        if not rec.get("commands"):
+            shutil.rmtree(tmp, ignore_errors=True)
+            return None
+        return {"session": session, "plan": plan, "rec": rec, "tmp": tmp}
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+
+def auto_learn_finish(prep):
+    """AFTER close_session: learn from the prepared recording -> the reply's `learned` (or None). The visit's
+    tabs are already closed, so a slow or killed learn never leaves them open; a challenge met while verifying
+    is never handed to a person (HUMAN_WAIT 0); the verify's own recipe-<host> session is closed afterwards
+    (the host had no recipe, so no earlier run owned it)."""
+    import shutil
+    global HUMAN_WAIT
+    if prep is None or "result" in prep:
+        return None if prep is None else prep["result"]
+    plan, session = prep["plan"], prep["session"]
+    argv = ["--session", session, "--name", plan["name"]]
+    for e in plan["expects"]:
+        argv += ["--expect", e]
+    old, HUMAN_WAIT = HUMAN_WAIT, 0
+    try:
+        out, _ = cmd_learn(argv, recording=prep["rec"])
+    finally:
+        HUMAN_WAIT = old
+        shutil.rmtree(prep["tmp"], ignore_errors=True)
+        try:
+            if browser.version():          # never start a browser just to close a session
+                browser.wb("close_session", {}, session=f"recipe-{plan['host']}")
+        except Exception:
+            pass
+    out = dict(out)
+    if out.get("ok"):
+        return {"ok": True, "id": out.get("id"), "tier": out.get("tier"), "kind": out.get("kind"),
+                "params": sorted(out.get("params") or {})}
+    return {"ok": False, "reason": str(out.get("reason") or out.get("error") or "")[:200]}
+
+
+def auto_learn(session):
+    """prepare + finish in one call (no close in between): tests and library callers."""
+    return auto_learn_finish(auto_learn_prepare(session))
 
 
 def cmd_recording(argv):

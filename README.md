@@ -25,6 +25,18 @@ Aider — and from plain Python. MIT. **Pre-1.0**: tested on Windows 11 (Edge), 
 Apple Silicon (Chrome) and Linux (headless Chromium); the background daemon added in 0.4 so far
 only on Windows and headless Linux.
 
+### At a glance
+
+| | deja-browser | agent-browser | Ego Lite | Claude in Chrome |
+|---|---|---|---|---|
+| Logins the agent can see | only the sites you logged its own profile into | a fresh profile per session (as run here) | the logins in that browser | everything you are logged in to in Chrome |
+| Repeat visit, chars for the model | **104–3,346** (replays a saved recipe) | 6,417–26,766 (re-reads the page) | 3,134–20,465 (re-reads the page) | 1.6–2.9× deja 0.3, excluding the tab list it appends (model-driven run) |
+| First visit, speed | 0.4–2.4 s slower per read on 3 of 4 pages | faster on 3 of 4 | faster on 3 of 4 | not comparable |
+| Outbound traffic of its own | none, checked by an egress test | not measured | not measured | not measured |
+
+Five public pages, three visits each, n = 3 rounds, one Windows PC, November 2026 — a small benchmark,
+not a ranking. Full table, conditions and where deja is behind: [Compared with other agent browsers](https://github.com/drpwchen/deja-browser#compared-with-other-agent-browsers).
+
 ## Quick start
 
 **Requirements & cost.** Python ≥ 3.11 and an installed Edge, Chrome, Chromium or Brave (Windows, macOS or Linux). Free (MIT), no accounts, no API keys; the only optional paid-account feature is the opt-in hCaptcha solver, which uses your own Gemini key.
@@ -48,9 +60,10 @@ the few choices that matter, has you log in to your sites by hand, and runs a sm
 
 ## Your first recipe
 
-The shortest way: do the task once through `deja-cdp` (a background daemon records the visit), then
-call `deja-browser learn --name <name> --session <task> --expect "<text from the answer>"`, which
-drafts, verifies and saves the recipe in one step (`deja-browser help learn`).
+The shortest way: do the task once through `deja-cdp`, ending with a `read` or `evaluate` that returns the
+answer, then `close_session`. It saves the visit as a recipe by itself (`"learned": {"ok": true, "id": …}` in its
+reply). To choose the name yourself, run `deja-browser learn --name <name> --session <task> --expect "<text from
+the answer>"` before closing (`deja-browser help learn`).
 
 The explicit way: capture the JSON request the site makes, and let `draft` write the recipe from it.
 The example is the site in the GIF (Hacker News search, through its public JSON API):
@@ -94,6 +107,17 @@ deja-browser list
 No recipes ship with the package — you (or your agent) build them per site from the first visit
 (`learn`, or `network_capture` plus `draft`). Recipes live in `<recipes dir>/<host>/<name>.json` and are
 addressed as `<host>/<name>`. `deja-browser help format` documents the full format.
+
+## Why it is built this way
+
+Each choice closes a way an agent can be wrong without anyone noticing.
+
+- **Recipes save themselves.** Closing the session learns the visit, and keeps the recipe only if a replay gives the same answer.
+- **A changed site returns "stale", never wrong data.** Every replay is checked against the shape it had when saved.
+- **No silent success.** Actions report the dialog they answered, the popups they opened and the frames on the page.
+- **Pages without an API still replay**, as recorded steps across postbacks, frames and popups.
+- **A step only a human can do** (a 2FA code) is handed over with `handoff`, then the flow continues.
+- **Writes need permission on every run** (`--allow-write`); passwords typed during a visit are never recorded.
 
 ## Compared with other agent browsers
 
@@ -218,6 +242,9 @@ its start, with `learn` and a learned recipe), traces every `connect()` of the t
 anything that is not `127.0.0.1` (its `SELFTEST=1` mode proves the check catches a deliberate
 connection). The only outbound features are ones you switch on: ntfy notifications and the opt-in
 hCaptcha solver.
+
+Recipes keep the values a visit used (a search term, say). For a visit whose inputs should not be kept, close it
+with `{"learn": false}`, or set `[recipes] auto_learn = false`.
 
 Two things no tool can change: the browser vendor's own services (e.g. Safe Browsing / SmartScreen
 URL checks) still apply to the agent profile, and whatever page content your agent reads goes to

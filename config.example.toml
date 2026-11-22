@@ -35,6 +35,11 @@
 #                                         # path ("ebank", "netbank", "webatm", "mybank", "etrade" ...;
 #                                         # recording.py NO_RECORD_DEFAULT). Holds even with
 #                                         # deny_hosts_enabled = false. This adds tokens.
+# auto_learn = true                      # default true: `deja-cdp close_session` turns the visit into a recipe
+#                                         # when its host has none yet and a replay reproduces the visit's last
+#                                         # read / evaluate result. Never for a visit that sent a request that may
+#                                         # change something, typed a password or used handoff. false = only
+#                                         # `deja-browser learn` saves recipes. (DEJA_BROWSER_AUTO_LEARN=0 too.)
 # allow_ticket_hosts = []                 # ticketing / rail booking hosts are refused by default
 #                                         # (anti-scalping laws). Lift one ("railway.gov.tw") or all
 #                                         # ("*") at your own risk — not recommended.

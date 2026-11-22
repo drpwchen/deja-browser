@@ -22,10 +22,13 @@ deja-cdp <action> '<json args>' --session <task>     # one line of JSON out
      `select {selector:"@e9", label}`; `then_snapshot:true` shows the result in the same reply.
    - Finish with one small `evaluate {code}` that returns just the answer (with no JSON API, it
      learns a script recipe; a final `read` learns a slower step-by-step one).
-3. Will this come back? `deja-browser learn --name <name> --session <task> --expect "<value>"`
-   (before `close_session`). `--expect` = text copied from the actual answer, ≥ 3 chars
-   (`"1.0.228"`, not `"version"`). `--param q=<value you typed>` names a param. On `ok:false`
-   follow its `hint`; on success tell the user what was saved.
+3. Learning is automatic: `close_session` learns the visit when the host has no recipe yet (name
+   from the session: `booking-1029` → `booking`; the check values from your last read / evaluate).
+   Its reply says `learned: {ok, id, …}` or why not; tell the user what was saved. To pick the
+   name, params or check values yourself, run `deja-browser learn --name <name> --session <task>
+   --expect "<value>"` before `close_session` (`--expect` = text from the answer, ≥ 3 chars,
+   `"1.0.228"` not `"version"`; `--param q=<value you typed>`). Pass `close_session {learn:false}`
+   for a visit that must not become a recipe.
 4. After a `navigate`: `deja-cdp close_session '{}' --session <task>`, also after a failure. A
    `run` alone needs none (it keeps its own `recipe-<host>` tab for the next replay).
 

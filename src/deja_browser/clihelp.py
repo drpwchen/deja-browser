@@ -115,10 +115,17 @@ attach_tab {tabId}  -> {success, tabId, tab, url, title, borrowed}
   Borrows an open tab (e.g. the one the user just logged in on); tabId or a short id "t2".
   close_session leaves borrowed tabs open.""",
     "close_session": """\
-close_session {}  -> {success, closed}
-  Closes the session's own tabs, popups they opened included; borrowed tabs stay open. Also
-  clears the session's recording, so run `deja-browser learn` first. Run it at the end of every
-  task, also after a failure.""",
+close_session {learn?}  -> {success, closed, learned?}
+  Closes the session's own tabs, popups they opened included; borrowed tabs stay open. Run it at
+  the end of every task, also after a failure. It clears the session's recording, so through the
+  daemon it first LEARNS the visit (auto-learn): when the host has no recipe yet and the visit
+  ended with a read / evaluate, it runs `deja-browser learn` with a name from the session
+  ("booking-1029" -> booking) and values from that last result as --expect, and saves the recipe
+  only if a replay reproduces them. Skipped: a visit that sent a request that is not clearly a read,
+  typed into a password field or used handoff / captcha_text; sessions recipe-* / learn-*.
+  learned: {ok, id, tier, kind, params} | {ok:false, skipped | reason}. learn:false skips it for
+  this close; [recipes] auto_learn = false or DEJA_BROWSER_AUTO_LEARN=0 turns it off. To choose
+  the name, params or --expect yourself, run `deja-browser learn` before close_session.""",
     "batch": """\
 batch {steps, stop_on_error=true, dialog, then_snapshot?}
   -> {ok, results:[{action, ok, data | error, secs}]}
@@ -275,7 +282,8 @@ deja-browser learn --name N --expect TEXT [--expect ...] [--session S] [--param 
                    [--keep-param NAME ...] [--description D] [--write] [--force] [--verbose]
   The visit the daemon recorded for session S (default "cli": pass the visit's --session) ->
   draft -> verify with the recorded values -> save the cheapest passing tier. Run it BEFORE
-  close_session (that clears the recording); DEJA_BROWSER_DAEMON=0 records nothing.
+  close_session (that clears the recording; it auto-learns a host with no recipe itself, see
+  deja-cdp help close_session); DEJA_BROWSER_DAEMON=0 records nothing.
   --expect: text from the actual answer, >= 3 chars ("1.0.228", not "version"). It must be in a
     recorded JSON response or in the first 2,000 chars of a read / evaluate result (snapshots
     don't count): end the visit with one small evaluate or read {query} returning the answer.

@@ -2668,8 +2668,40 @@ def wb(action, args=None, session="default"):
     return data
 
 
-def _main_via_daemon(cmd, args, session):
-    """CLI action through the daemon -> exit code (output printed), or None to run in-process."""
+class _AutoLearn:
+    """close_session's auto-learn (recipe.auto_learn_prepare / _finish): called with no args after a
+    successful close -> {"learned": ...} or None; never raises (learning must not break a close)."""
+
+    def __init__(self, prep):
+        self.prep, self.done = prep, False
+
+    def __call__(self):
+        self.done = True
+        try:
+            from . import recipe
+            learned = recipe.auto_learn_finish(self.prep)
+        except Exception as ex:
+            learned = {"ok": False, "error": f"{type(ex).__name__}: {ex}"[:200]}
+        return {"learned": learned} if learned is not None else None
+
+    def discard(self):
+        import shutil
+        if isinstance(self.prep, dict) and self.prep.get("tmp"):
+            shutil.rmtree(self.prep["tmp"], ignore_errors=True)
+
+
+def _auto_learn_hook(session):
+    try:
+        from . import recipe
+        prep = recipe.auto_learn_prepare(session)
+    except Exception as ex:
+        return {"learned": {"ok": False, "error": f"{type(ex).__name__}: {ex}"[:200]}}
+    return None if prep is None else _AutoLearn(prep)
+
+
+def _main_via_daemon(cmd, args, session, extra=None):
+    """CLI action through the daemon -> exit code (output printed), or None to run in-process. `extra` is
+    merged into a successful dict reply (close_session's `learned`)."""
     from . import client
     try:
         rep = client.cli_call(cmd, args, session, driver=os.environ.get("EDGE_CDP_DRIVER") or None)
@@ -2692,6 +2724,10 @@ def _main_via_daemon(cmd, args, session):
     out = rep.get("data")
     if dialogs and isinstance(out, dict):
         out = {**out, "dialogs": dialogs}
+    if callable(extra):
+        extra = extra()
+    if extra and isinstance(out, dict):
+        out = {**out, **extra}
     print(json.dumps(out, ensure_ascii=False))
     return 1 if cmd == "batch" and isinstance(out, dict) and out.get("ok") is False else 0
 
@@ -2713,7 +2749,14 @@ def main(argv=None):
         if len(argv) > 2:
             raise SystemExit(f"deja-cdp: unexpected arguments {argv[2:]} (usage: <action> '<json>' [--session S])")
         args = json.loads(argv[1]) if len(argv) > 1 else {}
-        r = _main_via_daemon(cmd, args, session)
+        extra = None
+        if cmd == "close_session":     # auto-learn: recording fetched before the close, learned after it
+            want = args.pop("learn", True) if isinstance(args, dict) else True
+            if want is not False:
+                extra = _auto_learn_hook(session)
+        r = _main_via_daemon(cmd, args, session, extra)
+        if isinstance(extra, _AutoLearn) and not extra.done:
+            extra.discard()
         if r is not None:
             return r
         try:

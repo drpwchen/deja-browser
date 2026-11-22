@@ -8,8 +8,11 @@ human is the last resort. It runs on anyone's machine, not just the author's.
 
 | Module | Role |
 |---|---|
-| `browser.py` | Starts / attaches to a Chromium browser over CDP on `127.0.0.1`, dedicated user-data dir. Named sessions own the tabs they open; `close_session` closes only those. CLI `deja-cdp`. |
-| `recipe.py` | Recipe store, the tier ladder (`http` → `page` → `script`), shape checks, login gate, CAPTCHA gate. CLI `deja-browser`. |
+| `browser.py` | Starts / attaches to a Chromium browser over CDP on `127.0.0.1`, dedicated user-data dir. Named sessions own the tabs they open (popups they open included); `close_session` closes only those. Element refs, frames, dialogs, `handoff`. CLI `deja-cdp`. |
+| `daemon.py`, `client.py` | Background daemon that keeps the driver and the CDP connection warm (127.0.0.1, token file, one worker per session; restarts itself when the code or config changes). The CLI talks to it through a stdlib-only client and falls back to running in-process. |
+| `recording.py`, `learn.py`, `draft.py` | Per-session recording of a first visit (memory only, secrets redacted) and `learn`, which turns it into a recipe; `draft` does the same from an explicit `network_capture`. |
+| `driverpipe.py` | Windows only: drains the Playwright driver's output between calls so an idle library caller can't stall the whole browser. |
+| `recipe.py` | Recipe store, the tier ladder (`http` → `page` → `script`, or `steps`), shape checks, login gate, CAPTCHA gate. CLI `deja-browser`. |
 | `hcaptcha.py` | Optional hCaptcha image/drag solver (cloud, opt-in). |
 | `config.py` | Reads `config.toml` from the OS config dir. Stdlib only. |
 | `guard.py` | Guard rails: refused hosts (shared by `navigate` and recipes), turning off the profile's own password / card / address autofill on launch, warning about password-manager extensions in the profile. Not a security boundary — separation is. |
@@ -26,6 +29,48 @@ verify time; a mismatch is reported as *stale* and never returned as data.
 
 `save` refuses a draft unless the exact same draft passed `verify`. Recipes with side effects
 (`"writes": true`) need `--allow-write` on every run.
+
+Flows with no JSON API that cross full-page postbacks, frames and popups (older / ASP.NET-style systems)
+are saved as `steps` recipes: browser actions replayed in order, each with an optional check
+(`expect`); a step that fails is reported as stale with its index.
+
+## First visit, then `learn`
+
+The first visit only does the task. While the agent works through the daemon, the session's actions and
+the responses on its own tabs are kept in memory (credential-looking values and anything typed into a
+password field stored as `<redacted>`; refused hosts and online-banking / trading pages never recorded).
+`close_session` runs `learn` itself when the host has no recipe yet (auto-learn, on by default; the check
+values come from the visit's last read / evaluate result, and a visit that sent a request that may change
+something is skipped). `deja-browser learn --name N --expect TEXT` does the same by hand. It tries, in order: a recorded JSON response that holds the
+answer (a `request` recipe), the last `evaluate` that returned it (a `script` recipe), the recorded
+actions (a `steps` recipe). It verifies with the recorded values and saves only the cheapest tier that
+passes; output is a few hundred characters, so learning costs the model almost nothing. A value that came
+from an earlier response (an id from a search result) is never silently reused as a constant.
+
+## No silent success
+
+An action that reports success must have done the thing. Before 0.4, testing pages that imitate older
+systems showed four correctness problems: a `confirm()` cancelled by the driver while `click` returned
+success; a dialog opening after a CLI call had exited, which blocked every later connection to the
+browser; iframe content invisible to `read` / `snapshot` with no hint; and `fill` on a `<select>` by its
+visible label returning success with nothing selected. Now:
+
+- **Dialogs** on the session's tabs are answered at once (the action's `dialog` policy, default: accept
+  `alert`, dismiss `confirm` / `prompt`) and reported in the reply; a dialog left open would block every
+  other client of the browser.
+- **Popups** opened by the session's tabs join the session (listed in the reply, closed by
+  `close_session`).
+- **Frames** are read and snapshotted with their content, each under a header with a selector prefix
+  that reaches into it; `select` reports the option actually in effect.
+- **Connecting** times out after 10 s and names the likely cause instead of hanging.
+
+The fixture is a set of local pages, not a real .NET application; no hospital system was tested.
+
+## A step for a human
+
+`handoff` gives the session's tab to a person (brought to the front, a notification, a "Done — hand back
+to the agent" button in the page) and continues when it is pressed, a condition holds, or a timeout
+passes. Meant for two-factor codes and judgement calls, so a flow doesn't restart.
 
 ## CAPTCHA gate
 
@@ -74,4 +119,6 @@ and are not usable (wrong coordinates, or minutes per challenge). The working op
 
 - A generic local vision-model endpoint (OpenAI-compatible) and an optional GPU-lock hook. They
   only matter once a local model is good enough for a CAPTCHA type; none is today.
-- Linux has browser detection but no real-machine test yet.
+- Linux is tested headless only (WSL2), and the 0.4 daemon not yet on macOS.
+- A recipe's first run in a session opens a new tab: 1.4–2.1 s on three of the four benchmark pages,
+  against 0.4–1.0 s once that tab is open.

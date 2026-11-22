@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.2] — 2026-11-22
+
+### Added
+- **Recipes save themselves.** `deja-cdp close_session` now turns the visit into a recipe (on by default): when the site has no recipe yet and the visit ended with a `read` or `evaluate`, it learns the visit and keeps the recipe only if a replay gives the same answer. The reply says what was saved (`learned`). Visits that sent a request that is not clearly a read, typed a password or handed the tab to a person are skipped. Turn it off per close with `{"learn": false}`, or with `[recipes] auto_learn = false`. A recipe keeps the values the visit used (for example the search term).
+
+### Docs
+- README: a comparison at a glance (agent-browser, Ego Lite, Claude in Chrome) and "Why it is built this way". `docs/design.md` brought up to date.
+
 ## [0.4.1] — 2026-11-22
 
 ### Testing

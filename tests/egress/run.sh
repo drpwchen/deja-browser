@@ -13,7 +13,8 @@
 #           (python + the playwright node driver it spawns), logging every connect/sendto.
 #   daemon  the background daemon is started first, under its own `strace -f` (it and every driver
 #           it spawns); then every CLI call runs under `strace -f` as above and talks to it. Adds
-#           the daemon-only path: the passive recording, `learn`, and a run of the learned recipe.
+#           the daemon-only path: the passive recording, `learn`, a run of the learned recipe, and a
+#           close_session that auto-learns a second visit (its verify replays it; checked: "learned").
 #           Fails if any call started a daemon of its own (that one would escape the daemon trace)
 #           or if the daemon trace saw no connection at all (it would not prove anything).
 # Every traced call has a timeout (STEP_TIMEOUT, default 120 s, then SIGKILL: strace ignores SIGTERM
@@ -105,6 +106,14 @@ EOF
   step tabs          $CDP list_tabs '{}' --session cap
   step deny          $CDP navigate '{"url":"https://mail.google.com/"}' --session cap
   if [ $MODE = daemon ]; then
+    # auto-learn at close_session, before the host has any recipe (else it is skipped by design)
+    step auto-nav    $CDP navigate '{"url":"http://127.0.0.1:8000/index.html"}' --session autol
+    step auto-fill   $CDP fill '{"selector":"#u","value":"ER_AUTO_MARKER"}' --session autol
+    step auto-click  $CDP click '{"selector":"#go"}' --session autol
+    step auto-read   $CDP read '{"query":"ER_BODY"}' --session autol
+    step auto-close  $CDP close_session '{}' --session autol
+    grep -A1 '^== daemon [0-9]* auto-close' $D/steps.txt | grep -q '"learned"' ||
+      echo "DAEMON_CHECK: close_session did not report auto-learn" >> $D/steps.txt
     step recording   $RCP recording --session cap
     step learn       $RCP learn --name learned --session cap --expect ER_API_MARKER --param q=ER_FILL_MARKER
     step run-learned $RCP run 127.0.0.1/learned '{"q":"ER_ARG_MARKER"}'

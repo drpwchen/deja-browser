@@ -5,7 +5,8 @@ What actually protects you is separation: the agent profile is never logged in t
 or brokerage, and it stores no passwords. The pieces here keep an agent from wandering into those
 sites by accident and keep stored secrets away from them:
 
-- check_host(url)          refuse mail / bank / broker hosts (and ticketing, for recipes)
+- check_host(url)          refuse mail / bank / broker hosts (and ticketing, for recipes);
+                           [recipes] deny_hosts_enabled = false turns the mail / bank / broker part off
 - harden_profile(profile)  turn off the browser's own password and card autofill in the profile
 - password_managers(profile)  list password-manager extensions installed in the profile
 
@@ -22,7 +23,7 @@ from . import config
 
 # substring of the host. Mail and account sign-in pages first (a Google / Microsoft sign-in opens
 # mail, files and calendars at once), then banks, brokers and payments. Extend with
-# [recipes] deny_hosts_extra.
+# [recipes] deny_hosts_extra; [recipes] deny_hosts_enabled = false switches the whole list off.
 DENY_HOSTS_DEFAULT = (
     # mail and account sign-in
     "mail.google.", "gmail.", "accounts.google.", "outlook.live.", "outlook.office.", "login.live.",
@@ -60,13 +61,21 @@ def host(url):
     return (urllib.parse.urlsplit(url).hostname or "").lower()
 
 
+def deny_hosts_enabled():
+    """[recipes] deny_hosts_enabled, default true. Only a real TOML `false` turns the list off (a
+    quoted "false" or a typo keeps it on). Read on every check, not cached at import."""
+    return config.get("recipes", "deny_hosts_enabled", True) is not False
+
+
 def check_host(url, tickets=True):
     """Raise HostRefused for a denied host. tickets=False skips the ticketing list (plain browsing:
-    looking at a timetable is fine; automated purchase through a recipe is what the list is for)."""
+    looking at a timetable is fine; automated purchase through a recipe is what the list is for).
+    [recipes] deny_hosts_enabled = false skips the mail / bank / broker list (deny_hosts_extra
+    included); the ticketing list is separate (allow_ticket_hosts)."""
     h = host(url)
-    if any(d in h for d in DENY_HOSTS):
+    if deny_hosts_enabled() and any(d in h for d in DENY_HOSTS):
         raise HostRefused(f"{h}: mail / account sign-in / banks / brokers are off-limits for the agent "
-                          "browser (see [recipes] deny_hosts_extra)")
+                          "browser (see [recipes] deny_hosts_extra / deny_hosts_enabled)")
     if tickets and any(d in h for d in TICKET_HOSTS):
         raise HostRefused(f"{h}: ticketing / rail booking sites are refused by default (anti-scalping "
                           "laws); see [recipes] allow_ticket_hosts")

@@ -224,6 +224,55 @@ class CliHelpTest(unittest.TestCase):
                 with mock.patch("sys.stdout"), mock.patch.object(browser, "_ctx", side_effect=AssertionError):
                     self.assertEqual(main([flag]), 0)
 
+    def _out(self, main, argv):
+        import io
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf), mock.patch.object(browser, "_ctx", side_effect=AssertionError), \
+                mock.patch.object(browser, "_main_via_daemon", side_effect=AssertionError):
+            rc = main(argv)
+        return rc, buf.getvalue()
+
+    def test_top_level_help_is_short(self):
+        from deja_browser import clihelp, recipe
+        for main in (browser.main, recipe.main):
+            rc, out = self._out(main, ["--help"])
+            self.assertEqual(rc, 0)
+            self.assertLess(len(out), 1500)      # a model reads this on every first visit
+        self.assertEqual(self._out(browser.main, [])[0], 2)
+        self.assertIn("help <action", clihelp.CDP_TOP)
+
+    def test_every_action_and_command_has_help(self):
+        import inspect
+        import re
+        from deja_browser import clihelp, recipe
+        cdp = set(browser.SESSION_ACTIONS) | set(browser.PAGE_ACTIONS) | {"launch", "status", "stop"}
+        self.assertEqual(cdp | set(clihelp.CDP_TOPICS), set(clihelp.CDP))
+        for name in cdp | set(clihelp.CDP_TOPICS):   # named on the top page, so a model finds it
+            self.assertRegex(clihelp.CDP_TOP, rf"\b{name}\b")
+        cmds = set(re.findall(r'cmd == "(\w+)"', inspect.getsource(recipe.main)))
+        self.assertEqual(cmds, set(clihelp.RECIPE_COMMANDS))
+        self.assertEqual(cmds | set(clihelp.RECIPE_TOPICS), set(clihelp.RECIPE))
+        for name in cmds | set(clihelp.RECIPE_TOPICS):
+            self.assertRegex(clihelp.RECIPE_TOP, rf"\b{name}\b")
+
+    def test_help_per_action(self):
+        from deja_browser import recipe
+        for argv in (["help", "snapshot"], ["snapshot", "--help"], ["click", "{}", "-h"], ["help", "refs"]):
+            rc, out = self._out(browser.main, argv)
+            self.assertEqual(rc, 0, argv)
+            self.assertNotIn("Topics:", out)          # the entry, not the top page
+        self.assertIn("refs:true", self._out(browser.main, ["help", "snapshot"])[1])
+        rc, out = self._out(browser.main, ["help", "nosuch"])
+        self.assertEqual(rc, 2)
+        self.assertIn("navigate", out)
+        rc, out = self._out(recipe.main, ["learn", "--help"])
+        self.assertEqual(rc, 0)
+        self.assertIn("--expect", out)
+        self.assertEqual(self._out(recipe.main, ["help", "format"])[0], 0)
+        rc, out = self._out(recipe.main, ["bogus"])
+        self.assertEqual(rc, 2)
+        self.assertIn("unknown command", out)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,7 +7,36 @@ pages: a search page backed by a JSON API (hn.algolia.com), a large Wikipedia ta
 Each task has three visits with different parameters, three rounds each, on one Windows 11 PC, November 2026.
 This is a small benchmark (n = 3, one machine, one model session each for deja and Claude in Chrome), not a general ranking.
 
-## Same model, same prompt (deja vs Claude in Chrome)
+## Round 4: deja-browser 0.4 (November 22)
+
+0.4 added a background daemon (one warm browser connection instead of a new process per call), element refs, and
+`learn`, which turns the visit just done into a saved recipe in one call. deja, agent-browser 0.43.0 and Ego Lite
+0.6.3.17 were scripted again on the same day and PC; one model session drove deja with the same neutral prompt as
+before. Claude in Chrome was not re-run (its figures below are from the earlier round). deja was measured at a
+pre-release commit of 0.4; the five pages had been used while 0.4 was developed.
+
+Scripted, four pages without the Cloudflare challenge, medians of n = 3 (chars handed back / seconds):
+
+| | deja 0.2 | deja 0.4 | agent-browser | Ego Lite |
+|---|---|---|---|---|
+| First visit, cheapest read that held the answer | 2,990–22,775 / 2.0–8.7 s | 3,012–22,775 / 1.8–4.3 s | 3,170–26,766 / 2.0–2.8 s | 2,830–20,465 / 1.0–4.0 s |
+| Repeat visit | recipe 104–3,236 / 0.9–1.7 s | recipe 104–3,346 / 0.4–1.0 s with the recipe's tab open, 1.4–2.1 s when it opens one | flow replay worked on 1 of 4 pages; re-read 6,417–26,766 / 0.6–1.6 s | re-read 3,134–20,465 / 0.7–4.5 s |
+
+- deja got faster on first visits to three of the four pages (the SPA, 3.5 → 3.8 s, is dominated by the page's
+  own loading) but agent-browser and Ego Lite were still faster on three of the four. On repeat visits deja
+  returns the least text by far; its time matches or beats the others when the recipe's tab is already open.
+- Cloudflare page: deja 9/9; Ego Lite passed every visit with a scripted checkbox click, agent-browser none (fresh
+  profile). In this round deja's profile already held the site's clearance from the model run minutes before, so
+  the challenge was solved for real only once (in the model run, 21.7 s for that visit).
+- Model-driven, same prompt: the five first visits read **8,979** characters (deja 0.3: 22,274; Claude in
+  Chrome: 9,854, or 2,947 without the tab list it appends to every result), and the model wrote no recipe code
+  itself (0.3: 2,143 characters); 45/45 visits answered. The same session took longer and cost more than with 0.3
+  (tool time 211 vs 186 s, 115 vs 72 calls): the skill told the model to close a session after every recipe run,
+  which it no longer does (not re-measured).
+
+## Round 3 (deja-browser 0.3)
+
+### Same model, same prompt (deja vs Claude in Chrome)
 
 Claude Opus 5.5 did the 45 visits once with each tool, from one neutral prompt that let it use each tool the way
 the tool's own documentation recommends, including running JavaScript in the page. agent-browser and Ego Lite
@@ -29,7 +58,7 @@ were not measured this way.
   solve it (its answers in 8 of the 9 visits say it would not; in the other it wrote no visible answer), which is
   what its documentation says it does.
 
-## Scripted runs and the first Claude in Chrome run
+### Scripted runs and the first Claude in Chrome run
 
 deja, agent-browser and Ego Lite were driven by fixed scripts; Claude in Chrome was driven by the model under a
 prompt that restricted how it read the page.

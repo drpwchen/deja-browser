@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Tell the human something (only used when a challenge or a login needs them).
+"""Tell the human something (a challenge or a login that needs them, a `handoff`).
 
 [notify]
   ntfy    = "https://ntfy.sh/<your-topic>"     POST to an ntfy topic
   command = ["prog", "--title", "{title}", "--message", "{message}"]   run any program;
             "{python}" is replaced by the current interpreter, ~ is expanded
-Neither set -> the message goes to stderr. Failures are swallowed: a notification never breaks a run.
+Neither set -> the message goes to stderr (under the daemon: its log file). Failures are swallowed: a
+notification never breaks a run.
 """
 import subprocess
 import sys
@@ -13,6 +14,18 @@ import urllib.parse
 import urllib.request
 
 from . import config
+
+
+def channel():
+    """Where notify() sends: "ntfy", "command" or "stderr" (from the config, nothing is sent)."""
+    try:
+        if config.get("notify", "ntfy"):
+            return "ntfy"
+        if config.get("notify", "command"):
+            return "command"
+    except Exception:
+        pass
+    return "stderr"
 
 
 def notify(title, message):
@@ -31,6 +44,6 @@ def notify(title, message):
                     for a in cmd]
             subprocess.run(argv, timeout=20, capture_output=True)
         else:
-            print(f"[deja-browser] {title}: {message}", file=sys.stderr)
+            print(f"[deja-browser] {title}: {message}", file=sys.stderr, flush=True)
     except Exception:
         pass

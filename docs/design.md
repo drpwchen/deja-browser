@@ -61,7 +61,8 @@ and are not usable (wrong coordinates, or minutes per challenge). The working op
 ## Guard rails
 
 - **Refused hosts.** Mail, banking and brokerage hosts are refused (built-in list plus
-  `deny_hosts_extra`). Ticketing and rail-booking hosts are refused by default because several
+  `deny_hosts_extra`); `deny_hosts_enabled = false` (default `true`) switches that list off, leaving
+  separation as the only protection. Ticketing and rail-booking hosts are refused by default because several
   jurisdictions criminalise automated ticket purchase; `allow_ticket_hosts` lifts entries if you
   decide otherwise — your call and your liability.
 - **Secrets by name.** Recipes hold `{secret:NAME}` placeholders; values are resolved in-process

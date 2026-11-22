@@ -35,6 +35,7 @@ with open(_CFG, "w", encoding="utf-8") as f:
     f.write(f"[browser]\nport = {TEST_PORT}\n")
 os.environ["DEJA_BROWSER_CONFIG"] = _CFG
 os.environ["DEJA_BROWSER_HOME"] = os.path.join(_TMP, "data")
+os.environ["DEJA_BROWSER_DAEMON"] = "0"   # main() must never spawn a detached daemon (it could start a browser)
 
 # ---------- no real browser from a unit test ----------
 

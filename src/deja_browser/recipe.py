@@ -7,51 +7,14 @@ verify a replay), the result is saved as a parameterised recipe, and later runs 
 onto `args` and run the recipe without an LLM reading the page again. This is our version, on
 top of the dedicated agent browser (`browser.py`).
 
-Recipe file: <recipes dir>/<host>/<name>.json   (id = "<host>/<name>"; dir = [recipes] dir in
-  config.toml, default <data dir>/recipes — see config.py)
-  {
-    "version": 1, "name", "description", "when_to_use", "entry_url",
-    "params": [{"name", "description", "required", "default"}],
-    "request": {"method", "url", "headers", "body"},      # API recipe; strings may hold {param}
-                                                          # and {secret:NAME} (secretstore.py, resolved
-                                                          # in-process, never printed/returned)
-    "script": "<async fn body of (args), returns small JSON>",   # DOM/form recipe (instead of request)
-    "pick": {"path": "hits", "fields": ["title", "url"], "limit": 20},   # shrink the result
-             # or {"select": {"version": "crate.max_stable_version"}}: name -> dotted path (a number
-             # indexes a list); on a list result it is applied to every row
-    "writes": false,                                      # true = side effects -> needs --allow-write
-    "driver": "playwright",                               # optional; default is patchright
-    "login": {"check": "<JS expr -> true when logged in>", "url", "user_secret", "pass_secret",
-              "user_selector", "pass_selector", "submit_selector"},     # optional
-    "tier": "http" | "page" | "script",                   # cheapest tier that verified
-    "expect": {"signature": {...}},                       # JSON shape of a good response
-    "verified_at", "last_run": {"at", "ok", "tier", "note"}, "notes": [...]
-  }
+Recipe file: <recipes dir>/<host>/<name>.json (id "<host>/<name>"; [recipes] dir in config.toml, default
+<data dir>/recipes — see config.py). Tiers: http -> page -> script, or steps for a steps recipe; every response is
+checked against expect.signature, a mismatch is stale, never data. Challenge pages go through challenge_gate():
+auto-clear (lazy Turnstile scrolled into view) -> trusted checkbox click -> reCAPTCHA audio via local whisper;
+text-image CAPTCHAs -> solve_image_captcha() (ddddocr). The human is the last resort.
 
-Tier ladder (cheapest first; a run falls through on failure and records what worked):
-  http   — urllib outside the browser, cookies pulled live from the agent browser (nothing stored)
-  page   — fetch() inside a tab on entry_url (site cookies, cf_clearance, CSRF all native)
-  script — the recipe's own script in the page (DOM read / form fill)
-Every response is checked against expect.signature; a mismatch is reported as stale, never
-returned as data. Challenge pages go through challenge_gate(), which solves them itself:
-auto-clear (lazy Turnstile scrolled into view) -> trusted checkbox click -> reCAPTCHA audio via local
-whisper; text-image CAPTCHAs -> solve_image_captcha() (ddddocr). The human is the last resort.
-
-CLI:
-  deja-browser list
-  deja-browser show <id>
-  deja-browser run <id> '<json args>' [--tier http|page|script] [--allow-write] [--data-only]
-      reserved arg "_limit": N  keeps at most N list items (only lowers the recipe's pick.limit)
-      --data-only  prints just the data on success (no ok/tier envelope)
-  deja-browser draft <capture.json> --expect "<text the answer needs>" [--expect …] [--param name=value …]
-                     [--name N] [--entry-url U] [--out FILE] [--force] [--keep-param NAME …]
-      capture.json = the output of `deja-cdp network_capture`. Writes a request draft from the response that
-      holds every --expect (params: the captured value becomes {name}); exit 2 + "applicable": false when no
-      JSON API holds the answer (nothing is written). Credential-looking query/body fields are dropped
-      unless named by --keep-param (public client keys). Review it, then verify. Rules: see draft.py.
-  deja-browser verify <draft.json> '<json args>'     try every tier, print shape + preview + output size
-  deja-browser save <draft.json>                     needs a passing verify of THIS draft
-  deja-browser gate <url>                            open url, clear any challenge, report
+The recipe JSON format, the tier ladder, steps recipes and every CLI command are documented for users in
+clihelp.py (`deja-browser help [<command | topic>]`: format, tiers, steps). Keep it in step with this file.
 """
 import gzip, hashlib, importlib.util, json, os, re, sys, time, urllib.parse, urllib.request, zlib
 from datetime import datetime
@@ -422,7 +385,8 @@ def solve_recaptcha_audio(page, tries=3):
 
 
 def solve_image_captcha(page, image_selector, input_selector, digits_only=False, tries=6, submit_selector=None,
-                        ok_check=None, case=None, length=None, refresh_selector=None, fields=None):
+                        ok_check=None, case=None, length=None, refresh_selector=None, fields=None,
+                        charset=None, preprocess=None, min_confidence=None):
     """Classic text-in-an-image CAPTCHA (library proxy, NDLTD style): offline ddddocr, retry on a miss.
     Reads the image's own pixels (not an element screenshot), re-reads wrong-length answers before
     submitting, rotates letter case across attempts unless `case` is given. See textcaptcha.py.
@@ -430,7 +394,8 @@ def solve_image_captcha(page, image_selector, input_selector, digits_only=False,
     from . import textcaptcha
     r = textcaptcha.solve(page, image_selector, input_selector, case=case, digits_only=digits_only,
                           length=length, tries=tries, submit_selector=submit_selector, ok_check=ok_check,
-                          refresh_selector=refresh_selector, fields=fields)
+                          refresh_selector=refresh_selector, fields=fields, charset=charset,
+                          preprocess=preprocess, min_confidence=min_confidence)
     return 0 if r["solved"] is False else r["attempts"]
 
 
@@ -515,15 +480,26 @@ def login_gate(page, login):
 
 # ---------- tiers ----------
 
-def _page_for(recipe, session):
-    """A tab on the recipe's entry origin (reused when already there)."""
+def _entry(recipe, args=None):
+    """entry_url with its {param} placeholders filled in (script recipes from `learn` may have them)."""
+    return _render(recipe["entry_url"], args or {}, secrets_ok=False)
+
+
+def _page_for(recipe, session, args=None):
+    """A tab on the recipe's entry origin (reused when already there). With "at_entry" or a templated
+    entry_url the tab must show that exact URL (navigated there unless it already does)."""
     ctx = browser._ctx()
+    want = _entry(recipe, args)
+    exact = bool(recipe.get("at_entry")) or want != recipe["entry_url"]
     try:
         page = browser._current(ctx, session)
-        if urllib.parse.urlsplit(page.url)[:2] != urllib.parse.urlsplit(recipe["entry_url"])[:2]:
+        if exact:
+            if page.url.split("#")[0] != want.split("#")[0]:
+                raise browser.NoTab("other page")
+        elif urllib.parse.urlsplit(page.url)[:2] != urllib.parse.urlsplit(want)[:2]:
             raise browser.NoTab("other origin")
     except browser.NoTab:
-        browser.wb("navigate", {"url": recipe["entry_url"]}, session=session)
+        browser.wb("navigate", {"url": want}, session=session)
         page = browser._current(ctx, session)
     return page
 
@@ -575,7 +551,7 @@ def tier_page(recipe, args, session):
 
 
 def tier_script(recipe, args, session):
-    page = _page_for(recipe, session)
+    page = _page_for(recipe, session, args)
     gate = challenge_gate(page)
     if not gate["cleared"]:
         return 0, {"_challenge": gate}
@@ -584,12 +560,155 @@ def tier_script(recipe, args, session):
     return 200, page.evaluate(code, args)   # script gets plain params; no secrets in scripts
 
 
-TIERS = {"http": tier_http, "page": tier_page, "script": tier_script}
+# ---------- steps: a recorded flow of browser actions, replayed in the session ----------
+
+STEP_ACTIONS = ("navigate", "click", "fill", "select", "wait", "evaluate", "read", "snapshot")
+STEP_OUTPUT = ("evaluate", "read", "snapshot")      # the last step: its result is the recipe's output
+STEP_KEYS = {"action", "args", "expect", "dialog", "note"}
+STEP_SETTLE = ("click", "select", "evaluate")       # may start a navigation (postback): settle before going on
+STEP_SETTLE_MS = 15000
+STEP_EXPECT_MS = 15000
+_CODE_ARGS = ("code", "js")                         # JavaScript: never string-substituted (params come as `args`)
+
+
+class StepFailed(RecipeError):
+    def __init__(self, step, action, msg):
+        super().__init__(f"step {step} ({action}): {msg}")
+        self.step, self.action = step, action
+
+
+def check_steps(steps):
+    """Validate a steps list (verify, save and every run). RecipeError on: an unknown action / key, snapshot
+    before the last step, a last step that returns nothing, a ref (@eN: refs are per snapshot), a
+    {secret:…} placeholder (not supported in steps), a placeholder in a navigate URL's host, a bad expect or
+    dialog."""
+    if not isinstance(steps, list) or not steps:
+        raise RecipeError("steps must be a non-empty list of {action, args, expect?, dialog?}")
+    if "{secret:" in json.dumps(steps, ensure_ascii=False):
+        raise RecipeError("steps may not use {secret:…} (a steps recipe never resolves secrets)")
+    last = len(steps) - 1
+    for i, s in enumerate(steps):
+        if not isinstance(s, dict) or s.get("action") not in STEP_ACTIONS:
+            raise RecipeError(f"step {i}: action must be one of {', '.join(STEP_ACTIONS)}")
+        act = s["action"]
+        extra = set(s) - STEP_KEYS
+        if extra:
+            raise RecipeError(f"step {i}: unknown key(s) {', '.join(sorted(extra))}")
+        a = s.get("args") or {}
+        if not isinstance(a, dict):
+            raise RecipeError(f"step {i}: args must be an object")
+        if act == "snapshot" and i != last:
+            raise RecipeError(f"step {i}: snapshot only as the last step")
+        if i == last and act not in STEP_OUTPUT:
+            raise RecipeError(f"the last step must be one of {', '.join(STEP_OUTPUT)} (its result is the output)")
+        exp = s.get("expect")
+        for where, obj in (("args", a), ("expect", exp if isinstance(exp, dict) else {})):
+            for k in ("selector", "frame"):
+                if browser.ref_id(obj.get(k)):
+                    raise RecipeError(f"step {i}: {where}.{k} {obj[k]!r} is a ref; refs belong to one snapshot, "
+                                      "use a CSS / role selector")
+        if act == "navigate":
+            u = a.get("url")
+            if not isinstance(u, str) or not u.startswith(("http://", "https://")):
+                raise RecipeError(f"step {i}: navigate needs an http(s) url")
+            if "{" in urllib.parse.urlsplit(u).netloc:
+                raise RecipeError(f"step {i}: a placeholder may not be in the host of a navigate url")
+        if exp is not None:
+            try:
+                browser.wait_condition(exp, what=f"step {i}: expect")
+            except browser.WbError as ex:
+                raise RecipeError(str(ex)) from None
+        if s.get("dialog") is not None:
+            try:
+                browser.parse_dialog_policy(s["dialog"])
+            except browser.WbError as ex:
+                raise RecipeError(f"step {i}: {ex}") from None
+    return steps
+
+
+def _render_step(obj, args):
+    """{param} / {param|url} in a step's string args; JavaScript (`code`, `js`) is left as is."""
+    if isinstance(obj, dict):
+        return {k: (v if k in _CODE_ARGS else _render_step(v, args)) for k, v in obj.items()}
+    return _render(obj, args, secrets_ok=False)
+
+
+def _expect_text(exp):
+    k, v = browser.wait_condition(exp)
+    return f"{k} {json.dumps(v, ensure_ascii=False)[:80]}"
+
+
+def tier_steps(recipe, args, session):
+    """Run the recipe's steps in order in the session's current tab (the first step normally navigates). A
+    step that fails or whose `expect` is not met within its timeout -> StepFailed (stale, with the index).
+    -> (200, the last step's value: evaluate value / read text / snapshot tree)."""
+    steps = check_steps(recipe["steps"])
+    ctx = browser._ctx()
+    if steps[0]["action"] != "navigate":
+        _page_for(recipe, session, args)
+    out, last_dialog, gated = None, None, False
+    for i, s in enumerate(steps):
+        act = s["action"]
+        sargs = _render_step(dict(s.get("args") or {}), args)
+        if s.get("dialog") is not None:
+            sargs["dialog"] = s["dialog"]
+        if act == "navigate":
+            _check_host(sargs["url"])
+        if act == "evaluate":
+            sargs["arg"] = dict(args)           # a function in `code` gets the params as its argument
+        watch = None
+        if act in STEP_SETTLE and i < len(steps) - 1:
+            try:
+                watch = browser._NavWatch(browser._current(ctx, session))
+            except browser.WbError:
+                watch = None
+        try:
+            data = browser.wb(act, sargs, session=session)
+        except Exception as ex:
+            if watch is not None:
+                watch.close()
+            note = f" (last dialog: {last_dialog})" if last_dialog else ""
+            raise StepFailed(i, act, f"{(str(ex).splitlines() or [''])[0][:200]}{note}") from None
+        if isinstance(data, dict) and data.get("dialog"):
+            d = data["dialog"]
+            last_dialog = f"{d.get('type')} {str(d.get('message'))[:60]!r} {d.get('handled')}"
+        if act == "wait" and isinstance(data, dict) and data.get("success") is False:
+            raise StepFailed(i, act, f"timed out after {data.get('waited_ms')} ms (stale recipe?)")
+        if watch is not None:
+            watch.settle(STEP_SETTLE_MS)
+        if act == "navigate":
+            page = browser._current(ctx, session)
+            gate = challenge_gate(page)
+            if not gate["cleared"]:
+                return 0, {"_challenge": gate}
+            if not gated and recipe.get("login"):
+                login_gate(page, recipe["login"])
+            gated = True
+        exp = s.get("expect")
+        if exp:
+            e = _render_step(dict(exp), args)
+            e.setdefault("timeout", STEP_EXPECT_MS)
+            try:
+                w = browser.wb("wait", e, session=session)
+            except Exception as ex:
+                raise StepFailed(i, act, f"expect {_expect_text(exp)}: {(str(ex).splitlines() or [''])[0][:160]}") \
+                    from None
+            if not w.get("success"):
+                note = f"; last dialog: {last_dialog}" if last_dialog else ""
+                raise StepFailed(i, act, f"expect {_expect_text(exp)} not met within {e['timeout']} ms "
+                                         f"(stale recipe?{note})")
+        out = data
+    last = steps[-1]["action"]
+    key = {"evaluate": "value", "read": "text", "snapshot": "tree_text"}[last]
+    return 200, (out or {}).get(key)
+
+
+TIERS = {"http": tier_http, "page": tier_page, "script": tier_script, "steps": tier_steps}
 
 
 def _ladder(recipe, start=None):
     have = ([t for t in ("http", "page") if recipe.get("request") is not None]
-            + (["script"] if recipe.get("script") else []))
+            + (["script"] if recipe.get("script") else []) + (["steps"] if recipe.get("steps") else []))
     if start:
         return [start] if start in have else []
     pref = recipe.get("tier")
@@ -598,7 +717,9 @@ def _ladder(recipe, start=None):
 
 def run(recipe, given, tier=None, allow_write=False, session=None, check_sig=True):
     _check_host(recipe["entry_url"])
-    if recipe.get("driver") and recipe["driver"] != browser._DRIVER:
+    if "{" in urllib.parse.urlsplit(recipe["entry_url"]).netloc:
+        raise RecipeError("entry_url: a placeholder may not be in the host")
+    if recipe.get("driver") and recipe["driver"] != browser.current_driver():
         browser.disconnect()
         browser.use_driver(recipe["driver"])   # "patchright" for reCAPTCHA-v3-scored pages
     if recipe.get("writes") and not allow_write:
@@ -612,8 +733,12 @@ def run(recipe, given, tier=None, allow_write=False, session=None, check_sig=Tru
     for t in _ladder(recipe, tier):
         try:
             status, data = TIERS[t](recipe, args, session)
+        except StepFailed as ex:                 # the site no longer matches the recorded flow
+            tried.append({"tier": t, "step": ex.step, "action": ex.action, "stale": True,
+                          "error": str(ex).splitlines()[0][:300]})
+            continue
         except Exception as ex:
-            tried.append({"tier": t, "error": str(ex).splitlines()[0][:200]})
+            tried.append({"tier": t, "error": (str(ex).splitlines() or [""])[0][:200]})
             continue
         if isinstance(data, dict) and "_challenge" in data:
             tried.append({"tier": t, "challenge": data["_challenge"]})
@@ -677,7 +802,54 @@ def _write(p, obj):
 
 def _draft_hash(d):
     keep = {k: d.get(k) for k in ("entry_url", "request", "script", "params", "pick", "login", "writes")}
+    if d.get("steps") is not None:
+        keep["steps"] = d["steps"]
+    if d.get("at_entry"):
+        keep["at_entry"] = True
     return hashlib.sha256(json.dumps(keep, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def needs_in_process(recipe):
+    """A recipe that may resolve a secret runs in the calling process, never in the daemon: {secret:…}
+    anywhere, a login block, or the opt-in cloud hCaptcha solver (reads its API key)."""
+    return (bool(recipe.get("login")) or "{secret:" in json.dumps(recipe, ensure_ascii=False)
+            or hcaptcha.enabled())
+
+
+def _run_via_daemon(rid, given, tier, allow_write, data_only):
+    """`run` through the daemon (warm driver + connection). -> (out, rc), or None to run in-process."""
+    from . import client
+    if not client.enabled():
+        return None
+    rec = load(rid)
+    if needs_in_process(rec):
+        return None
+    _check_host(rec["entry_url"])
+    try:
+        rep = client.cli_call("recipe.run", {"rid": rid, "given": given, "tier": tier, "allow_write": allow_write,
+                                             "data_only": data_only},
+                              session=f"recipe-{_host(rec['entry_url'])}", driver=rec.get("driver"),
+                              prog="deja-browser")
+    except client.LostReply as ex:
+        return {"ok": False, "error": f"lost the daemon's reply ({ex}); the recipe may or may not have run"}, 1
+    if rep is None:
+        return None
+    dialogs = rep.get("dialogs")
+    if not rep.get("ok"):
+        if rep.get("kind") == "Exception":
+            print(rep.get("traceback") or rep.get("error"), file=sys.stderr)
+            return None, 1
+        out = {"ok": False, "error": rep.get("error")}
+        if dialogs:
+            out["dialogs"] = dialogs
+        return out, 1
+    out = rep.get("data")
+    if dialogs:
+        if isinstance(out, dict) and not data_only:
+            out = {**out, "dialogs": dialogs}
+        else:
+            print(json.dumps({"dialogs": dialogs}, ensure_ascii=False), file=sys.stderr)
+    return out, 0 if not (isinstance(out, dict) and out.get("ok") is False) else 1
 
 
 def cmd_run(rid, given, tier=None, allow_write=False, data_only=False):
@@ -699,11 +871,11 @@ def cmd_run(rid, given, tier=None, allow_write=False, data_only=False):
     return res
 
 
-def _page_chars(recipe, session):
+def _page_chars(recipe, session, args=None):
     """Length of the entry page's visible text — what reading the page instead would cost. None when
     it can't be measured (no browser, or the page is a challenge, whose text says nothing)."""
     try:
-        page = _page_for(recipe, session)
+        page = _page_for(recipe, session, args)
         if challenge(page):
             return None
         return int(page.evaluate("() => (document.body ? document.body.innerText : '').length"))
@@ -724,11 +896,12 @@ def cmd_draft(argv):
     ap.add_argument("--out")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--keep-param", action="append", default=[])
+    ap.add_argument("--verbose", action="store_true")
     try:
         ns = ap.parse_args(argv)
     except SystemExit:
         raise RecipeError("usage: draft <capture.json> --expect <text> [--expect …] [--param name=value …] "
-                          "[--name N] [--entry-url U] [--out FILE] [--force] [--keep-param NAME]") from None
+                          "[--name N] [--entry-url U] [--out FILE] [--force] [--keep-param NAME] [--verbose]") from None
     params = {}
     for kv in ns.param:
         k, eq, v = kv.partition("=")
@@ -755,7 +928,7 @@ def cmd_draft(argv):
     except draft.DraftError as ex:
         raise RecipeError(str(ex)) from None
     if not rep["applicable"]:
-        return rep
+        return rep if ns.verbose else draft_summary(rep)
     d = rep["draft"]
     _check_host(d["entry_url"])
     out = Path(ns.out) if ns.out else cap_path.with_suffix(".draft.json")
@@ -765,36 +938,86 @@ def cmd_draft(argv):
     sample = json.dumps(params, ensure_ascii=False)
     rep["draft_path"] = str(out)
     rep["next"] = f"{Path(sys.argv[0]).name} verify {out} '{sample}'"
-    return rep
+    return rep if ns.verbose else draft_summary(rep)
+
+
+def draft_summary(rep):
+    """The default `draft` output: what to check before verify, not the whole report (--verbose)."""
+    if not rep.get("applicable"):
+        out = {"applicable": False, "reason": rep.get("reason")}
+        if rep.get("found_in_non_json"):
+            out["found_in_non_json"] = rep["found_in_non_json"][:2]
+        if rep.get("skipped"):
+            out["skipped"] = [f"{s['why']}: {s['url'][:80]}" for s in rep["skipped"][:2]]
+        out["suggest"] = rep.get("suggest")
+        return out
+    d = rep["draft"]
+    req = d["request"]
+    p = urllib.parse.urlsplit(req.get("url", ""))
+    out = {"applicable": True, "draft_path": rep.get("draft_path"),
+           "request": f"{req.get('method', 'GET')} {p.netloc}{p.path[:100]}",
+           "params": [x["name"] for x in d.get("params", [])], "pick": d.get("pick"), "matched": rep.get("matched")}
+    w = rep.get("warnings") or []
+    if w:
+        out["warnings"] = [x[:200] for x in w[:3]]
+        if len(w) > 3:
+            out["more_warnings"] = len(w) - 3
+    if rep.get("alternatives"):
+        out["alternatives"] = len(rep["alternatives"])
+    out["next"] = rep.get("next")
+    return out
+
+
+def _verify_tiers(d, given, expects=(), session=None):
+    """Run a draft on every tier it has. -> (results, passed tiers, {tier: signature}). With `expects`, a tier
+    passes only if its (picked) output holds every one of them as a value (draft.find_paths)."""
+    results, sigs = [], {}
+    for t in _ladder(d):
+        r = run(d, given, tier=t, allow_write=True, session=session, check_sig=False)
+        if r["ok"]:
+            picked = pick(r["data"], d.get("pick"))
+            missing = [e for e in expects if not draft.find_paths(picked, e)]
+            sigs[t] = signature(picked)
+            same = next((u for u, g in sigs.items() if u != t and g == sigs[t]), None)
+            row = {"tier": t, "ok": not missing, "out_chars": len(json.dumps(picked, ensure_ascii=False)),
+                   "preview": f"same shape as {same}" if same else _preview(picked)}
+            if missing:
+                row["missing"] = missing
+            results.append(row)
+        else:
+            results.append({"tier": t, "ok": False, "tried": r["tried"]})
+    return results, [r["tier"] for r in results if r["ok"]], sigs
+
+
+def _write_verified(draft_path, d, passed, sigs, given):
+    _write(Path(draft_path).with_suffix(".verified.json"),
+           {"at": time.time(), "hash": _draft_hash(d), "passed": passed,
+            "signature": sigs[passed[0]] if passed else None, "args": given})
+
+
+def _check_draft(d):
+    for k in ("name", "description", "entry_url"):
+        if not d.get(k):
+            raise RecipeError(f"draft needs {k!r}")
+    if not (d.get("request") or d.get("script") or d.get("steps")):
+        raise RecipeError("draft needs request, script or steps")
+    _check_host(d["entry_url"])
+    if d.get("steps") is not None:
+        check_steps(d["steps"])
+        for s in d["steps"]:
+            if s["action"] == "navigate":
+                _check_host(s["args"]["url"])
 
 
 def cmd_verify(draft_path, given):
     d = json.loads(Path(draft_path).read_text(encoding="utf-8"))
-    for k in ("name", "description", "entry_url"):
-        if not d.get(k):
-            raise RecipeError(f"draft needs {k!r}")
-    if not (d.get("request") or d.get("script")):
-        raise RecipeError("draft needs request or script")
-    _check_host(d["entry_url"])
-    results, sigs = [], {}
-    for t in _ladder(d):
-        r = run(d, given, tier=t, allow_write=True, check_sig=False)
-        if r["ok"]:
-            picked = pick(r["data"], d.get("pick"))
-            sigs[t] = signature(picked)
-            same = next((u for u, g in sigs.items() if u != t and g == sigs[t]), None)
-            results.append({"tier": t, "ok": True, "out_chars": len(json.dumps(picked, ensure_ascii=False)),
-                            "preview": f"same shape as {same}" if same else _preview(picked)})
-        else:
-            results.append({"tier": t, "ok": False, "tried": r["tried"]})
-    passed = [r["tier"] for r in results if r["ok"]]
-    side = Path(draft_path).with_suffix(".verified.json")
-    _write(side, {"at": time.time(), "hash": _draft_hash(d), "passed": passed,
-                  "signature": sigs[passed[0]] if passed else None, "args": given})
+    _check_draft(d)
+    results, passed, sigs = _verify_tiers(d, given)
+    _write_verified(draft_path, d, passed, sigs, given)
     out = {"passed": passed, "cheapest": passed[0] if passed else None, "results": results,
            "next": f"{Path(sys.argv[0]).name} save {draft_path}" if passed else "fix the draft and verify again"}
-    if passed:
-        pc = _page_chars(d, f"recipe-{_host(d['entry_url'])}")
+    if passed and not d.get("steps"):           # a steps recipe's entry page is not where its answer is
+        pc = _page_chars(d, f"recipe-{_host(d['entry_url'])}", _args(d, given))
         if pc is not None:
             out["page_chars"] = pc
             big = next(r for r in results if r["ok"])["out_chars"]
@@ -810,6 +1033,8 @@ def cmd_save(draft_path):
     if not side.exists():
         raise RecipeError("verify this draft first")
     v = json.loads(side.read_text(encoding="utf-8"))
+    if d.get("steps") is not None:
+        check_steps(d["steps"])
     if v["hash"] != _draft_hash(d):
         raise RecipeError("draft changed after verify — verify again")
     if not v["passed"] or time.time() - v["at"] > 3600:
@@ -819,6 +1044,214 @@ def cmd_save(draft_path):
     rid = f"{_host(d['entry_url'])}/{d['name']}"
     _write(_path(rid), d)
     return {"saved": rid, "tier": d["tier"], "path": str(_path(rid))}
+
+
+# ---------- learn: recording -> verified, saved recipe ----------
+
+LEARN_OUT = 400      # chars of the default learn output (success or failure)
+
+
+def _learn_fail(reason, hint="", verbose=None):
+    out = {"ok": False, "reason": reason, "hint": hint}
+    if verbose is not None:
+        return {**out, "details": verbose}
+    from . import learn
+    return learn.compact(out, LEARN_OUT)
+
+
+def _host_ok(url):
+    try:
+        guard.check_host(url)
+        return True
+    except guard.HostRefused:
+        return False
+
+
+def _verify_failure(kind, results, plan):
+    """One-line reason + hint for a plan whose verify failed."""
+    bits = []
+    for r in results:
+        if r.get("missing"):
+            bits.append(f"{r['tier']}: output lacks {r['missing'][0][:40]!r}")
+        elif not r["ok"]:
+            t = (r.get("tried") or [{}])[-1]
+            why = t.get("error") or (f"status {t['status']}" if t.get("status") else None) or \
+                ("challenge not cleared" if t.get("challenge") else "failed")
+            bits.append(f"{r['tier']}: {str(why)[:80]}")
+    reason = f"verify of the {kind} recipe failed ({'; '.join(bits) or 'no tier to run'}); nothing saved"
+    rep = plan.get("report") or {}
+    if rep.get("dropped"):
+        hint = (f"the request lost credential-looking field(s) {', '.join(rep['dropped'][:3])}; if it is a public "
+                f"key from the page source, learn again with --keep-param {rep['dropped'][0]}")
+    elif rep.get("redacted_headers"):
+        hint = (f"the page sent {', '.join(rep['redacted_headers'][:3])} (not copied); recipes that need secrets are "
+                "out of scope for learn: write one by hand with {secret:NAME}")
+    elif kind == "script":
+        hint = "the code may depend on page state from the visit (clicks, scrolling, a login); check it with verify"
+    elif kind == "steps":
+        hint = ("the replayed flow did not reach the same answer (see the step); learn again with --verbose to see "
+                "the steps, or with --param to name the values that change")
+    else:
+        hint = "check the --expect strings, or learn again with --verbose for the details"
+    return reason, hint
+
+
+def cmd_learn(argv):
+    """`learn --name N --expect S … [--session S] [--param n=v …] [--keep-param K …] [--write] [--force]
+    [--verbose]` -> (output dict, exit code). See learn.py for the rules."""
+    import argparse
+    import shutil
+    import tempfile
+    from . import client, learn
+    ap = argparse.ArgumentParser(prog="deja-browser learn", add_help=False)
+    ap.add_argument("--session", default="cli")
+    ap.add_argument("--name")
+    ap.add_argument("--expect", action="append", default=[])
+    ap.add_argument("--param", action="append", default=[])
+    ap.add_argument("--keep-param", action="append", default=[])
+    ap.add_argument("--description")
+    ap.add_argument("--write", action="store_true")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--verbose", action="store_true")
+    try:
+        ns = ap.parse_args(argv)
+    except SystemExit:
+        return _learn_fail("usage: learn --name N --expect TEXT [--expect …] [--session S] [--param name=value …] "
+                           "[--keep-param NAME] [--write] [--force] [--verbose]"), 2
+    V = {} if ns.verbose else None
+    if not ns.name or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", ns.name):
+        return _learn_fail("--name is required (letters, digits, _ . -)", "", V), 2
+    if not ns.expect or any(len(e) < draft.MIN_EXPECT for e in ns.expect):
+        return _learn_fail(f"give --expect: text the answer needs, >= {draft.MIN_EXPECT} chars each", "", V), 2
+    try:
+        explicit = learn.parse_params(ns.param)
+    except learn.LearnError as ex:
+        return _learn_fail(ex.reason, ex.hint, V), 2
+    if not client.enabled():
+        return _learn_fail("nothing is recorded in-process (DEJA_BROWSER_DAEMON=0): only the daemon records visits",
+                           "capture the request with deja-cdp network_capture, then deja-browser draft", V), 1
+    tmp = Path(tempfile.mkdtemp(prefix="deja-learn-"))
+    try:
+        try:
+            rep = client.call_running("recording", {"body_dir": str(tmp)}, session=ns.session)
+        except (client.Unavailable, client.LostReply) as ex:
+            return _learn_fail(f"no recording to learn from ({ex})",
+                               "do the visit with deja-cdp (the daemon records it), then learn before close_session",
+                               V), 1
+        if not rep.get("ok"):
+            return _learn_fail(f"recording: {rep.get('error')}", "", V), 1
+        rec = rep["data"]
+        if V is not None:
+            V["recording"] = {"responses": len(rec.get("responses") or []), "commands": len(rec.get("commands") or []),
+                              "url": rec.get("url")}
+        if not rec.get("responses") and not rec.get("commands"):
+            return _learn_fail(f"session {ns.session!r} has no recording",
+                               "learn with the --session of the visit, before close_session (it clears the "
+                               "recording)", V), 1
+        plans, errors = [], []
+        try:
+            p1, rep1 = learn.plan_api(rec, ns.expect, explicit, ns.keep_param, ns.name, _host_ok, ns.write,
+                                      ns.description)
+            if V is not None:
+                V["draft"] = rep1
+            if p1:
+                plans.append(p1)
+        except learn.LearnError as ex:
+            errors.append(ex)
+        try:
+            p2 = learn.plan_script(rec, ns.expect, explicit, ns.name, ns.description, ns.write)
+            if p2:
+                plans.append(p2)
+        except learn.LearnError as ex:
+            errors.append(ex)
+        if not plans:                     # path 3: replay the recorded browser actions
+            blocking = [e for e in errors if not getattr(e, "fallback", False)]
+            if blocking:
+                return _learn_fail(blocking[0].reason, blocking[0].hint, V), 1
+            try:
+                p3 = learn.plan_steps(rec, ns.expect, explicit, ns.name, ns.description, ns.write)
+            except learn.LearnError as ex:
+                return _learn_fail(ex.reason, ex.hint, V), 1
+            if p3:
+                plans.append(p3)
+        if not plans:
+            if errors:
+                return _learn_fail(errors[0].reason, errors[0].hint, V), 1
+            docs = learn.found_in_documents(rec, ns.expect)
+            if docs:
+                return _learn_fail(f"the answer is in the page HTML ({docs[-1][:100]}), not in a JSON response, and "
+                                   "no evaluate returned it",
+                                   "run one evaluate that returns just the answer's fields, then learn again", V), 1
+            big = any(r.get("type") == "document" and r.get("body_error") == "too big"
+                      for r in rec.get("responses") or [])
+            return _learn_fail("no recorded JSON response, read or evaluate result contains every --expect"
+                               + (" (the page HTML was too big to keep)" if big else ""),
+                               "read the answer (deja-cdp read / evaluate, same --session) so the recording holds "
+                               "it, then learn again; or check the --expect text", V), 1
+        rid = f"{_host(plans[0]['draft']['entry_url'])}/{ns.name}"
+        if _path(rid).exists() and not ns.force:
+            return _learn_fail(f"recipe {rid} exists", "pass --force to replace it, or choose another --name", V), 1
+        first_fail = None
+        for plan in plans:
+            d = plan["draft"]
+            # a steps flow is verified in a fresh tab of its own session (closed afterwards), never in the tab
+            # of the visit or of an earlier run
+            vs = f"learn-{_host(d['entry_url'])}" if plan["kind"] == "steps" else None
+            try:
+                _check_draft(d)
+                results, passed, sigs = _verify_tiers(d, plan["args"], ns.expect, **({"session": vs} if vs else {}))
+            except (RecipeError, browser.WbError) as ex:
+                results, passed, sigs = [{"tier": "-", "ok": False, "tried": [{"error": str(ex)[:200]}]}], [], {}
+            finally:
+                if vs:
+                    try:
+                        browser.wb("close_session", {}, session=vs)
+                    except Exception:
+                        pass
+            if V is not None:
+                V.setdefault("verify", []).append({"kind": plan["kind"], "draft": d, "results": results})
+            if not passed:
+                first_fail = first_fail or _verify_failure(plan["kind"], results, plan)
+                continue
+            dp = tmp / "learn.draft.json"
+            _write(dp, d)
+            _write_verified(dp, d, passed, sigs, plan["args"])
+            saved = cmd_save(str(dp))
+            row = next(r for r in results if r["tier"] == passed[0])
+            out = {"ok": True, "id": saved["saved"], "tier": saved["tier"], "kind": plan["kind"],
+                   "params": {k: str(v)[:40] for k, v in plan["args"].items()}, "sample_chars": row["out_chars"]}
+            if V is not None:
+                return {**out, "details": V}, 0
+            return learn.compact(out, LEARN_OUT), 0
+        return _learn_fail(*first_fail, V), 1
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def cmd_recording(argv):
+    """`recording [--session S] [--clear] [--verbose]`: what the daemon recorded for a session (no bodies)."""
+    from . import client
+    session = "cli"
+    if "--session" in argv:
+        i = argv.index("--session")
+        session = argv[i + 1]
+    try:
+        if "--clear" in argv:
+            rep = client.call_running("recording", {"clear": True}, session=session)
+        else:
+            rep = client.call_running("recording", {}, session=session)
+    except (client.Unavailable, client.LostReply) as ex:
+        return {"ok": False, "error": f"no daemon recording: {ex}"}
+    if not rep.get("ok"):
+        return {"ok": False, "error": rep.get("error")}
+    data = rep["data"]
+    if "--verbose" in argv or "cleared" in data:
+        return data
+    resp = data.get("responses") or []
+    return {"session": session, "url": data.get("url"), "responses": len(resp), "commands": len(data.get("commands") or []),
+            "json": [f"{r.get('method')} {draft.clean_url(r.get('url', ''))[:100]}" for r in resp
+                     if "json" in (r.get("mime") or "")][-5:],
+            "last": [f"{c['n']} {c['action']} {'ok' if c.get('ok') else 'failed'}" for c in data.get("commands") or []][-5:]}
 
 
 def cmd_list():
@@ -853,9 +1286,11 @@ def main(argv=None):
         i = argv.index("--tier")
         tier = argv[i + 1]
         del argv[i:i + 2]
-    if not argv or argv[0] in ("-h", "--help", "help"):
-        print(__doc__)
-        return 0 if argv else 2
+    from . import clihelp
+    if clihelp.wants_help(argv):
+        text, rc = clihelp.recipe_help(clihelp.topic_of(argv))
+        print(text)
+        return rc if argv else 2
     cmd, rest = argv[0], argv[1:]
     js = lambda i: json.loads(rest[i]) if len(rest) > i else {}  # noqa: E731
     try:
@@ -864,11 +1299,22 @@ def main(argv=None):
         elif cmd == "show":
             out = load(rest[0])
         elif cmd == "run":
+            r = _run_via_daemon(rest[0], js(1), tier, "--allow-write" in flags, "--data-only" in flags)
+            if r is not None:
+                if r[0] is not None:
+                    print(json.dumps(r[0], ensure_ascii=False))
+                return r[1]
             out = cmd_run(rest[0], js(1), tier, "--allow-write" in flags, "--data-only" in flags)
         elif cmd == "draft":
             out = cmd_draft(rest)
             print(json.dumps(out, ensure_ascii=False))
             return 0 if out.get("applicable") else 2
+        elif cmd == "learn":
+            out, rc = cmd_learn(rest)
+            print(json.dumps(out, ensure_ascii=False))
+            return rc
+        elif cmd == "recording":
+            out = cmd_recording(rest)
         elif cmd == "verify":
             out = cmd_verify(rest[0], js(1))
         elif cmd == "save":
@@ -876,7 +1322,7 @@ def main(argv=None):
         elif cmd == "gate":
             out = cmd_gate(rest[0])
         else:
-            print(__doc__)
+            print(f"deja-browser: unknown command {cmd!r}", clihelp.recipe_help()[0], sep="\n\n")
             return 2
     except (RecipeError, browser.WbError) as ex:
         print(json.dumps({"ok": False, "error": str(ex)}, ensure_ascii=False))

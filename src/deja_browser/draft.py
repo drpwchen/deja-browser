@@ -260,9 +260,11 @@ def _slug(s):
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-") or "api"
 
 
-def build(capture, expects, params=None, name=None, entry_url=None, description=None, host_ok=None, keep=()):
+def build(capture, expects, params=None, name=None, entry_url=None, description=None, host_ok=None, keep=(),
+          skip=()):
     """capture: the parsed network_capture result. -> report dict; report["draft"] is the recipe
-    draft when report["applicable"] is true."""
+    draft when report["applicable"] is true. skip: request indices ("i") not to pick (learn: a candidate
+    it refused)."""
     params = dict(params or {})
     keep = set(keep or ())
     expects = list(expects or [])
@@ -282,6 +284,8 @@ def build(capture, expects, params=None, name=None, entry_url=None, description=
     for item in reqs:
         status = item.get("status")
         if not isinstance(status, int) or not 200 <= status < 300:
+            continue
+        if skip and item.get("i") in skip:
             continue
         data, text = _load_body(item)
         if data is None:
@@ -400,6 +404,7 @@ def build(capture, expects, params=None, name=None, entry_url=None, description=
         alts.append({"i": c["item"].get("i"), "method": c["item"].get("method", "GET"), "url": clean_url(c["item"].get("url", "")),
                      "bytes": c["item"].get("body_bytes"), "paths": {e: ".".join(p) for e, p in ch.items()}})
     return {"applicable": True, "checked": base, "picked": {"i": it.get("i"), "bytes": it.get("body_bytes")},
+            "dropped": best["dropped"], "redacted_headers": redacted,
             "matched": {e: ".".join(p) for e, p in chosen.items()},
             "other_matches": {e: [".".join(p) for p, _ in sorted(best["found"][e], key=lambda h: (not h[1], len(h[0]), _order(h[0])))
                                   if p != chosen[e]][:3] for e in expects},

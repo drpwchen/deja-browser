@@ -5,96 +5,53 @@ description: Drive a real browser through deja-browser — a dedicated Chromium 
 
 # deja-browser
 
-A browser profile that only the agent uses. The user logged in to the sites you may use, by
-hand; it holds no passwords and is never logged in to mail, banks or brokers.
-
-Use it only when an API, plain HTTP or a web-fetch tool cannot get the page.
-
-## Command shape
+The agent's own browser profile; the user logged in to its sites by hand. Use it only when an
+API or plain HTTP can't get the page. `deja-cdp help <action>` gives any action's args.
 
 ```sh
-deja-cdp <action> '<json args>' --session <task-name>
+deja-cdp <action> '<json args>' --session <task>     # one line of JSON out
 ```
 
-Always give `--session`. Output is one line of JSON. Close the session at the end of every
-task, also after a failure: `deja-cdp close_session '{}' --session <task-name>`.
+## Flow
 
-| action | args |
-|---|---|
-| `navigate` | `{url, newTab}` |
-| `snapshot` | `{max_chars, selector, interactive_only, query}` — accessibility tree, trimmed |
-| `evaluate` | `{code}` — runs in the page, may be `async () => {...}` |
-| `click` / `fill` | `{selector}` / `{selector, value}` — trusted input events |
-| `wait` | `{text}` or `{selector, state}` or `{js}`, plus `timeout` (default 15000) — `{success, waited_ms}`; a timeout is `success: false`, not an error |
-| `batch` | `{steps: [{action, args, quiet}], stop_on_error}` — several actions in one call, see below |
-| `network_capture` | `{trigger, url_filter, types, wait_ms, body_dir}` — the requests one trigger causes |
-| `captcha_text` | `{image, input, submit, ok, fields, case, length, refresh, tries}` — text-in-an-image CAPTCHA (offline `ddddocr`), see below |
-| `screenshot` / `save_as_pdf` | `{path, ...}` — returns the file path, not the image |
-| `list_tabs`, `find_tab`, `attach_tab`, `cdp`, `close_session` | see `deja-cdp --help` |
+1. Recipe for this host? `deja-browser list` (`navigate` replies list them too) →
+   `deja-browser run <host>/<name> '<json args>'`. No page read.
+2. Else do the task once:
+   - `navigate {url}`, then `read {query}` or `snapshot {refs:true, interactive_only:true, max_chars:3000}`.
+   - Act on the refs: `click {selector:"@e5"}`, `fill {selector:"@e7", value}`,
+     `select {selector:"@e9", label}`; `then_snapshot:true` shows the result in the same reply.
+   - Finish with one small `evaluate {code}` that returns just the answer (with no JSON API, it
+     learns a script recipe; a final `read` learns a slower step-by-step one).
+3. Will this come back? `deja-browser learn --name <name> --session <task> --expect "<value>"`
+   (before `close_session`). `--expect` = text copied from the actual answer, ≥ 3 chars
+   (`"1.0.228"`, not `"version"`). `--param q=<value you typed>` names a param. On `ok:false`
+   follow its `hint`; on success tell the user what was saved.
+4. After a `navigate`: `deja-cdp close_session '{}' --session <task>`, also after a failure. A
+   `run` alone needs none (it keeps its own `recipe-<host>` tab for the next replay).
 
-`deja-cdp launch` opens the browser window (for the user to log in); `status`, `stop`.
+## Legacy pages
 
-Every `deja-cdp` call is a new process (about 0.5 s to start the driver and connect), so when you
-already know the next few steps, send them as one `batch`:
+- Frames: `read` / `snapshot` include iframe and frameset content under a
+  `[frame … selector prefix: "…"]` header; `frame:"#work"` (or a frame ref) scopes an action.
+- Dialogs: an action's reply carries `dialog: {type, message, handled}`; by default `confirm` /
+  `prompt` are dismissed. Pass `dialog:"accept"` (or the prompt text) when it should go through.
+- Popups: replies list `popups: [{tab, url}]`; switch with `attach_tab {tabId:"t2"}`.
+- Partial postbacks: `wait {selector}` (`deja-cdp help wait`).
+- Flows with no JSON API still `learn`: they become `steps` recipes.
 
-```bash
-deja-cdp batch '{"steps":[
-  {"action":"navigate","args":{"url":"https://example.com"},"quiet":true},
-  {"action":"wait","args":{"text":"Example Domain"}},
-  {"action":"evaluate","args":{"code":"document.title"}}]}' --session demo
-```
+## A human is needed
 
-The result is `{ok, results:[{action, ok, data | error, secs}]}`. A failed step (an error, or a `wait` that timed out) stops the batch and
-marks the rest `skipped` (`"stop_on_error": false` keeps going); `quiet: true` drops a successful
-step's payload; batches cannot be nested; each step goes through the same host guard as a single call.
-
-Text-in-an-image CAPTCHA on a login form: use `captcha_text`, never a `screenshot` you OCR
-yourself. It reads the image's own pixels (an element screenshot is often cropped or rescaled),
-re-reads an answer of the wrong length before sending it, and tries the code as read, then upper
-case, then lower case. A rejected submit usually reloads the form empty, so pass the other fields
-in `fields` — they are refilled on every attempt and never echoed back:
-
-```bash
-deja-cdp captcha_text '{"image":"img.captcha","input":"#code","submit":"#login",
-  "ok":"!document.querySelector(\"#password\")","fields":{"#user":"…","#password":"…"}}' --session lib
-```
-
-`ok` is a JS expression that is true once the site accepted the code. Without `submit` it only
-reads and fills (`{code, plausible, source, …}`). In Python: `recipe.solve_image_captcha(page, …)`.
-
-## Cheapest first
-
-1. `deja-browser list` — a saved recipe for this site and task? `deja-browser run <id> '<args>'`.
-2. `evaluate` returning only the fields you need.
-3. `snapshot` with `query` / `selector` / `interactive_only`, always with `max_chars`.
-4. Screenshots to a file; read the image only if you must.
-
-## Saving a recipe (when the same task on the same site will come back)
-
-1. Find where the data comes from: an API or the DOM. Try the API first: `network_capture` the
-   request that holds the answer (`"types":"all"` when the request is a page navigation to the
-   API URL), and save its output to a file.
-2. Try `draft` first. It writes a request recipe from the capture, without you writing JSON:
-   `deja-browser draft capture.json --expect "<text the answer needs>" --param <name>=<value used in the capture> --out draft.json`.
-   Fill in the `TODO` fields it leaves (`when_to_use`, the param description) and check `pick`.
-   Exit code 2 with `"applicable": false` means no JSON response holds the answer (the data is in
-   the HTML): write a `script` recipe instead. Do not hand-write a request recipe for a JSON API
-   that `draft` can already handle. A draft from a POST has `"writes": true`; set it to `false`
-   by hand only if the POST just reads.
-   If you must write the JSON yourself, the format is in `deja-browser --help`. Parameters as
-   `{param}`, secrets only as `{secret:NAME}`.
-3. `deja-browser verify draft.json '<args>'` — no pass, no save.
-4. `deja-browser save draft.json`, then tell the user what was saved and how to call it.
-5. A later run says *stale*: do the task by hand this once, then verify and save again.
-
-`"writes": true` recipes need `--allow-write` and the user's go-ahead.
+Try first: `captcha_text` for an image-text CAPTCHA (hard images: give `charset`, `length`,
+`preprocess`, `min_confidence`; `deja-cdp help captcha_text`), `deja-browser gate <url>` for other
+challenges. Login, 2FA, a failed challenge or a judgement: `handoff {message:"Log in, then
+press Done"}` gives the user the tab and a Done button; continue on `success:true`.
 
 ## Rules
 
-- Refused hosts (mail, account sign-in, banks, brokers, payments) are a guard rail, not a lock.
-  Never work around a refusal; tell the user.
+- Refused hosts (mail, account sign-in, banks, brokers, payments) are a guard rail; never work
+  around one — tell the user. Only the user may switch the list off
+  (`[recipes] deny_hosts_enabled = false`); never change it yourself.
+- Recipes that change something (`"writes": true`, `learn --write`) run only with
+  `--allow-write` and the user's go-ahead for each run.
 - Never ask for or print secret values.
-- Missing login: `deja-cdp launch`, ask the user to log in in that window. 2FA is the user's.
-- CAPTCHA: `deja-browser gate <url>`; if it says a human is needed, say so.
-- Sensitive pages (health, personal data): ask before reading them; what you read goes to your
-  model provider.
+- Sensitive pages (health, personal data): ask first; what you read goes to your model provider.

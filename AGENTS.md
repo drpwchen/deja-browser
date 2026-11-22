@@ -74,15 +74,18 @@ deja-cdp <action> '<json args>' --session <task-name>
 
 - Always pass `--session` with a name for the task. Tabs belong to the session;
   `close_session` closes only those. **Close your session when the task ends**, also after a failure.
-- Read pages cheaply. In order: an existing recipe (`deja-browser list`) → `evaluate` returning
-  small JSON → `snapshot` with `query`, `selector` or `interactive_only` and a `max_chars` →
-  full snapshot last. Screenshots and PDFs go to a `path`; read the file only if you must.
-- Finding the API behind a page: `network_capture` with one `trigger`; bodies are written to
-  files, credential headers come back redacted (their names tell you what a replay needs).
-- Recipes: write a draft JSON, `deja-browser verify draft.json '<args>'`, then
-  `deja-browser save draft.json`, later `deja-browser run <host>/<name> '<args>'`. A *stale*
-  result means the site changed: do the task by hand once, then re-verify. Never patch a recipe
-  mid-run.
+- A recipe for this site? `deja-browser list` (a `navigate` reply lists them too) →
+  `deja-browser run <host>/<name> '<args>'`, no page read.
+- Otherwise do the task once: `read {query}` or `snapshot {refs: true, interactive_only: true,
+  max_chars: 3000}`, act on the refs (`click {selector: "@e5"}`, `fill`, `select`, with
+  `then_snapshot: true`), and finish with one small `evaluate {code}` that returns just the answer.
+  Screenshots and PDFs go to a `path`; read the file only if you must.
+- If the task will come back: `deja-browser learn --name <name> --session <task-name> --expect
+  "<a value from the answer>"` before `close_session`. It drafts, verifies and saves the recipe in
+  one call; on `ok: false` follow its `hint`. `--expect` is text from the answer, not a field name.
+- A *stale* run means the site changed: do the task by hand once, then `learn` again (`--force`).
+  Never patch a recipe mid-run. `deja-cdp help <action>` / `deja-browser help <command>` give
+  the details.
 - Recipes that change something on the site (`"writes": true`) need `--allow-write`, and you
   need the user's go-ahead for each such run.
 
@@ -92,7 +95,8 @@ deja-cdp <action> '<json args>' --session <task-name>
   by `navigate` and by recipes. This is a guard rail against mistakes, **not** a security
   boundary: a script in a page can still redirect there. The real protection is that the
   profile is never logged in to them and stores no passwords. Do not work around the refusal; if
-  a task needs one of those sites, stop and tell the user.
+  a task needs one of those sites, stop and tell the user. Only the user can switch the list
+  off, in config (`[recipes] deny_hosts_enabled = false`); never change that setting yourself.
 - Never ask for, print, or write a secret value. Recipes name secrets (`{secret:NAME}`); the
   value is resolved inside the tool and never returned.
 - Ticketing and rail-booking sites are refused for recipes by default (anti-scalping laws). Only

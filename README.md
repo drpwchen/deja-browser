@@ -21,8 +21,9 @@ recipe replay 588 characters of JSON. Wall time (median of 3) 3.5 s plus model r
   recipes only name them.
 
 Works with any agent that can run shell commands — Claude Code, Codex CLI, Gemini CLI, Cursor,
-Aider — and from plain Python. MIT. **Early release (0.1)**: tested on Windows 11 (Edge), macOS on
-Apple Silicon (Chrome) and Linux (headless Chromium).
+Aider — and from plain Python. MIT. **Pre-1.0**: tested on Windows 11 (Edge), macOS on
+Apple Silicon (Chrome) and Linux (headless Chromium); the background daemon added in 0.4 so far
+only on Windows and headless Linux.
 
 ## Quick start
 
@@ -47,7 +48,11 @@ the few choices that matter, has you log in to your sites by hand, and runs a sm
 
 ## Your first recipe
 
-The usual way: capture the JSON request the site makes, and let `draft` write the recipe from it.
+The shortest way: do the task once through `deja-cdp` (a background daemon records the visit), then
+call `deja-browser learn --name <name> --session <task> --expect "<text from the answer>"`, which
+drafts, verifies and saves the recipe in one step (`deja-browser help learn`).
+
+The explicit way: capture the JSON request the site makes, and let `draft` write the recipe from it.
 The example is the site in the GIF (Hacker News search, through its public JSON API):
 
 ```sh
@@ -86,20 +91,35 @@ deja-browser run hn.algolia.com/search '{"q": "rust"}'  # replay: titles + URLs,
 deja-browser list
 ```
 
-No recipes ship with the package — you (or your agent) build them per site, usually from a
-`network_capture` of the first visit. Recipes live in `<recipes dir>/<host>/<name>.json` and are
-addressed as `<host>/<name>`. `deja-browser --help` documents the full format.
+No recipes ship with the package — you (or your agent) build them per site from the first visit
+(`learn`, or `network_capture` plus `draft`). Recipes live in `<recipes dir>/<host>/<name>.json` and are
+addressed as `<host>/<name>`. `deja-browser help format` documents the full format.
 
-## Compared with browser-extension bridges
+## Compared with other agent browsers
 
-| | Extension bridge | deja-browser |
-|---|---|---|
-| Where the agent acts | an extension with full debugger access, inside the browser where you are logged in to everything | its own profile, logged in only to the sites you chose |
-| Keeping it off sensitive sites | browsers no longer let you fence such extensions away from chosen sites | those sites are simply not logged in; a refused-host list as a guard rail |
-| Outbound traffic | some phone home with no way to turn it off | none of its own, checked by an egress test |
-| Repeat visits | read the page again | replay a recipe (~50× less text in the demo) |
+Measured on one Windows 11 PC in November 2026: five public pages (a search page backed by a JSON API, a large
+Wikipedia table, a two-step server-side form, a JavaScript single-page app, a Cloudflare demo page), three visits
+each with different parameters, n = 3. "Chars" is what the tool handed back to the model. Small benchmark, not a
+ranking; conditions and raw method in [docs/benchmark.md](https://github.com/drpwchen/deja-browser/blob/main/docs/benchmark.md).
 
-A small benchmark against agent-browser, Ego Lite and Claude in Chrome, with the conditions that favour deja: [docs/benchmark.md](https://github.com/drpwchen/deja-browser/blob/main/docs/benchmark.md).
+| | deja-browser 0.4 | agent-browser 0.43 | Ego Lite 0.6.3 | Claude in Chrome |
+|---|---|---|---|---|
+| What it is | Python CLI + background daemon over CDP | Rust CLI + per-session daemon | a Chromium-based browser with a built-in agent service | an extension in your own Chrome |
+| Whose logins the agent sees | its own profile, logged in only to the sites you chose | a fresh profile per session (as run here) | the logins in that browser | everything you are logged in to in Chrome |
+| What a repeat visit reuses | a recipe saved by `learn` (HTTP call, page script, or recorded steps) | a recorded flow (`flow save`) | nothing: reads the page again | nothing: reads the page again |
+| Repeat visit, chars (4 pages without Cloudflare, scripted) | **104–3,346** (recipe) | flow replay worked on 1 of 4 pages (50,793); re-read 6,417–26,766 | re-read 3,134–20,465 | model-driven run: 8.6–24.6× deja (1.6–2.9× without the tab list it appends) |
+| Repeat visit, seconds (same) | 0.4–1.0 when the recipe's tab is open; 1.4–2.1 when it opens a new one | 0.6–1.6 | 0.7–4.5 | not comparable (timed from the chat log) |
+| First visit, seconds per read (same) | 1.8–4.3 | 2.0–2.8 | 1.0–4.0 | not comparable |
+| First visit, chars per read (same) | 3,012–22,775 | 3,170–26,766 | 2,830–20,465 | — |
+| First visits, model-driven (5 pages, same prompt, Claude Opus) | 8,979 chars, recipes saved for 4 of the 5 pages | not measured | not measured | 9,854 chars (2,947 without the tab list); nothing saved |
+| Cloudflare demo page | 9/9 (built-in gate ticks the checkbox) | 0/63 with a scripted click | every visit with a scripted click | stops at the challenge, by design |
+| Old-style pages (dialogs, frames, popups) | reported and handled; 35 checks on a local fixture | an `alert` froze the tab for 30 s, then it was replaced by a blank tab | not measured | not measured |
+| Outbound traffic of its own | none, checked by an egress test | not measured | not measured | not measured |
+
+Where deja is behind: agent-browser and Ego Lite were each faster on first visits to three of the four pages, and a
+recipe's first run in a session (new tab) takes 1.4–2.1 s on three of them. The pages were used while 0.4 was
+developed, deja and Ego Lite ran on long-lived profiles (agent-browser on fresh ones, which matters for
+Cloudflare), and the Claude in Chrome figures come from the 0.3.0 round.
 
 ## What it does
 
@@ -115,7 +135,8 @@ A small benchmark against agent-browser, Ego Lite and Claude in Chrome, with the
 - **Recipe tier ladder**, cheapest first, falling through on failure and recording what worked:
   `http` (plain HTTP outside the browser, cookies read live from the browser, never stored) →
   `page` (`fetch()` in a tab on the site: native cookies, Cloudflare clearance, CSRF) → `script`
-  (the recipe's own JavaScript in the page: DOM read / form fill).
+  (the recipe's own JavaScript in the page: DOM read / form fill). Flows with no JSON API that
+  cross page loads, frames and popups are saved as `steps` recipes (browser actions replayed in order).
 - **Shape checks.** Every response is compared with the JSON shape recorded at verify time; a
   mismatch is reported as *stale*, never returned as data.
 - **Write guard.** Recipes with side effects (`"writes": true`) only run with `--allow-write`.
@@ -129,8 +150,9 @@ A small benchmark against agent-browser, Ego Lite and Claude in Chrome, with the
   if you install those extras; the hCaptcha solver only if you enable it. Otherwise it notifies you.
   `deja-browser gate <url>` opens a URL, clears any challenge and reports.
 - **Guard rails.** `navigate` and recipes refuse mail, account sign-in, banking, brokerage and
-  payment hosts (built-in list, extendable); recipes also refuse ticketing / rail-booking hosts by
-  default. These stop accidents, not attackers — see *Safety model*.
+  payment hosts (built-in list, extendable, on by default; `[recipes] deny_hosts_enabled = false`
+  switches it off); recipes also refuse ticketing / rail-booking hosts by default. These stop
+  accidents, not attackers — see *Safety model*.
 
 ## Options at a glance
 
@@ -166,7 +188,7 @@ wb("snapshot", {"max_chars": 4000}, session="task")
 wb("close_session", {}, session="task")
 ```
 
-`deja-cdp --help` lists every action and its return shape.
+`deja-cdp --help` lists the actions; `deja-cdp help <action>` gives one action's arguments and reply.
 
 ## Safety model
 
@@ -176,6 +198,14 @@ navigating there by mistake and keeps stored secrets from being typed into those
 script can still redirect the tab, and an agent with shell access can edit your config. Treat it
 as a seat belt, not a lock.
 
+You can take the seat belt off: `[recipes] deny_hosts_enabled = false` (default `true`) turns the
+refused-host list off, built-in entries and `deny_hosts_extra` alike. Then `navigate` and recipes
+open mail, bank and broker pages, and a recipe's login step may type stored secrets into them.
+This suits a setup where the agent should fill a bank's public form (say, a card-promotion sign-up)
+but has no account there: keep it that way — never log the profile in to those sites and never
+store their passwords as secrets — because that separation is now the only protection. The
+ticketing list is a separate setting and stays on.
+
 Password managers: do not install their extension in the agent profile — while unlocked it can
 fill any saved password for whatever is driving the page. To let the agent log in to a few
 low-risk sites by itself, give it a dedicated vault through the password manager's CLI
@@ -183,7 +213,8 @@ low-risk sites by itself, give it a dedicated vault through the password manager
 limited to one vault; an unlocked Bitwarden CLI can read the whole vault.
 
 No telemetry: `tests/egress/run.sh` runs every action and a full recipe cycle inside a network
-namespace with only loopback, traces every `connect()` of the tool's processes, and fails on
+namespace with only loopback, once in-process and once through the background daemon (traced from
+its start, with `learn` and a learned recipe), traces every `connect()` of the tool's processes, and fails on
 anything that is not `127.0.0.1` (its `SELFTEST=1` mode proves the check catches a deliberate
 connection). The only outbound features are ones you switch on: ntfy notifications and the opt-in
 hCaptcha solver.
@@ -233,7 +264,7 @@ hexagon shape-matching type 1/5 (small samples). Failures fall through to the hu
 
 ## Limitations
 
-- Early release (0.1). Linux is tested headless only; Firefox and Safari are not supported (no CDP).
+- Pre-1.0: commands and the recipe format may still change. Linux is tested headless only, and the 0.4 daemon not yet on macOS; Firefox and Safari are not supported (no CDP).
 - Recipes are built per site by you or your agent; none ship with the package, and a site change can make a recipe stale (reported as stale, never returned as data).
 - The refused-host list is a guard rail, not a lock (see Safety model).
 - The CAPTCHA gate is best effort: the hCaptcha solver is opt-in and its pass rates above are from small samples. When it fails, it asks a human.

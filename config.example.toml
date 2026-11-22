@@ -23,6 +23,18 @@
 #                                         # banks, brokers, payments). Substring of the host. Guard rail,
 #                                         # not a lock: `navigate` and recipes refuse, page scripts can
 #                                         # still redirect.
+# deny_hosts_enabled = true               # default true. false = switch the refused-host list above
+#                                         # (built-in + deny_hosts_extra) off: `navigate` and recipes
+#                                         # then open mail, bank and broker pages, and a recipe login
+#                                         # may type stored secrets into them. Only do this if the
+#                                         # profile is never logged in there and you never store those
+#                                         # passwords as secrets — that separation is then your only
+#                                         # protection. Ticketing hosts are separate (next key).
+# no_record_extra = ["secure.mybroker"]    # the daemon's recording (what `learn` reads) never keeps online
+#                                         # banking / web ATM / online trading pages: a token in host +
+#                                         # path ("ebank", "netbank", "webatm", "mybank", "etrade" ...;
+#                                         # recording.py NO_RECORD_DEFAULT). Holds even with
+#                                         # deny_hosts_enabled = false. This adds tokens.
 # allow_ticket_hosts = []                 # ticketing / rail booking hosts are refused by default
 #                                         # (anti-scalping laws). Lift one ("railway.gov.tw") or all
 #                                         # ("*") at your own risk — not recommended.

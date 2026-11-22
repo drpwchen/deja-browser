@@ -19,9 +19,40 @@ class FakeLocator:
         if self.sel not in self.page.dom:
             raise TimeoutError(f"waiting for {self.sel}")
         self.page.clicked.append(self.sel)
+        if self.page.click_hook:
+            self.page.click_hook(self.sel)
 
-    def evaluate(self, js, timeout=None):
-        return ["button", self.page.dom[self.sel].get("text", "")]
+    def count(self):
+        return self.page.dom[self.sel].get("count", 1) if self.sel in self.page.dom else 0
+
+    def evaluate(self, js, arg=None, timeout=None, isolated_context=None):
+        el = self.page.dom[self.sel]
+        if js == ec._JS_FILL_EL:            # the JS fill fallback, through the locator
+            if "options" in el:
+                return {"select": el["options"]}
+            self.page.values[self.sel] = arg
+            return ["input", "value"]
+        if js == ec._JS_OPTIONS:
+            return el["options"]
+        if js == ec._JS_SELECTED:
+            return next(({"value": v, "label": lab} for v, lab in el["options"] if v == el.get("selected")), None)
+        if js == ec._JS_SET_SELECT:
+            el["selected"] = arg
+            return True
+        return ["button", el.get("text", "")]
+
+    def select_option(self, value=None, label=None, index=None, timeout=None):
+        el = self.page.dom[self.sel]
+        if el.get("hidden"):
+            raise RuntimeError("Element is not visible")
+        opts = el["options"]
+        hit = (next((v for v, lab in opts if value in (v, lab)), None) if value is not None else
+               next((v for v, lab in opts if lab == label), None) if label is not None else
+               opts[index][0] if index is not None and index < len(opts) else None)
+        if hit is None:
+            raise TimeoutError(f"Timeout {timeout}ms exceeded.")
+        el["selected"] = hit
+        return [hit]
 
     def screenshot(self, path=None, type=None, quality=None):
         Path(path).write_bytes(b"\xff\xd8shot")
@@ -45,6 +76,13 @@ class FakePage:
         self.waits, self.wait_fails = [], False
         self.aria = {}          # selector -> aria_snapshot text (default: 50 heading lines)
         self.texts = {}         # selector -> innerText
+        self.click_hook = None  # callable(selector) run after a click (e.g. raise a dialog)
+
+    def opener(self):
+        return None
+
+    def listeners(self, event):
+        return []
 
     def goto(self, url, wait_until=None, timeout=None):
         self.url = url
@@ -68,6 +106,8 @@ class FakePage:
             raise TimeoutError(f"waiting for {sel}")
         if self.dom[sel].get("readonly"):
             raise RuntimeError("Element is not editable")
+        if "options" in self.dom[sel]:
+            raise RuntimeError("Element is not an <input>, <textarea> or [contenteditable] element")
         self.values[sel] = val
 
     def eval_on_selector(self, sel, js):
@@ -122,9 +162,23 @@ class FakeCdp:
         pass
 
 
+class FakeBrowserCdp:
+    """Browser-level CDP session: Target.getTargets lists the fake context's open pages."""
+    def __init__(self, ctx):
+        self.ctx = ctx
+
+    def send(self, method, params=None):
+        assert method == "Target.getTargets", method
+        self.ctx.target_calls += 1
+        return {"targetInfos": [{"targetId": p.tid, "type": "page", "url": p.url, "title": p.title(),
+                                 "openerId": getattr(p, "opener_tid", None)} for p in self.ctx.all_pages]}
+
+
 class FakeCtx:
     def __init__(self):
         self.all_pages = []
+        self.target_calls = 0
+        self.browser = mock.Mock(new_browser_cdp_session=lambda: FakeBrowserCdp(self))
 
     @property
     def pages(self):
@@ -202,6 +256,12 @@ class EdgeCdpTest(_FakeBrowserCase):
         with mock.patch.object(ec, "_DRIVER", "patchright"):
             ec.wb("evaluate", {"code": "1+1"}, session="s1")
         self.assertIs(self.ctx.pages[0].evals[-1][2], False)
+
+    def test_patchright_network_capture_trigger_evaluates_in_main_world(self):
+        self.nav()
+        with mock.patch.object(ec, "_DRIVER", "patchright"):
+            ec.wb("network_capture", {"trigger": {"evaluate": "go()"}, "wait_ms": 0}, session="s1")
+        self.assertEqual(self.ctx.pages[0].evals[-1], ("go()", None, False))
 
     def test_fill_native_and_readonly_fallback(self):
         self.nav()
@@ -997,6 +1057,114 @@ class TestLeftoverTest(unittest.TestCase):
                 self.assertEqual(ec.is_orphaned_test_browser(1, lo), want, state)
         with mock.patch.object(ec, "_parent_state", side_effect=AssertionError("no lookup")):
             self.assertFalse(ec.is_orphaned_test_browser(1, r"D:\Profiles\Edge\User Data"))
+
+
+
+class ThreadStateTest(unittest.TestCase):
+    """v0.4: connection, driver and targetId cache are per thread (daemon workers); a single-threaded
+    caller sees the old module-level behaviour."""
+
+    def test_connection_state_is_per_thread(self):
+        import threading
+        ec._tls.browser = "main-browser"
+        seen = {}
+
+        def other():
+            seen["browser"] = ec._tls.browser
+            ec.use_driver("patchright")
+            ec._tls.browser = "worker-browser"
+            seen["driver"] = ec.current_driver()
+
+        try:
+            t = threading.Thread(target=other)
+            t.start()
+            t.join()
+            self.assertIsNone(seen["browser"])
+            self.assertEqual(seen["driver"], "patchright")
+            self.assertEqual(ec._tls.browser, "main-browser")
+            self.assertEqual(ec._browser, "main-browser")       # read-only compat attribute
+            self.assertEqual(ec.current_driver(), ec._DRIVER)   # the worker's override did not leak
+        finally:
+            ec._tls.browser = None
+
+    def test_use_driver_on_main_thread_sets_the_process_default(self):
+        with mock.patch.object(ec, "_DRIVER", "playwright"):
+            ec.use_driver("patchright")
+            self.assertEqual(ec._DRIVER, "patchright")
+            self.assertEqual(ec.current_driver(), "patchright")
+
+    def test_targetid_cache_ignores_a_recycled_id(self):
+        class P:
+            pass
+        a, b = P(), P()
+        ec._tls.tid[id(b)] = (a, "T-old")      # an entry whose page object is not b
+        try:
+            self.assertIsNone(ec.cached_target_id(b))
+        finally:
+            ec._tls.tid.pop(id(b), None)
+
+
+class SessionFileTest(_FakeBrowserCase):
+    def test_save_merges_only_the_given_session(self):
+        ec._save({"a": {"tabs": ["A"], "borrowed": [], "current": "A"}})
+        m = {"b": {"tabs": ["B"], "borrowed": [], "current": "B"}}   # a writer that loaded before "a" existed
+        ec._save(m, "b")
+        saved = json.loads(ec.SESSIONS_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(set(saved), {"a", "b"})
+        ec._save({}, "a")                                           # popped -> deleted
+        self.assertEqual(set(json.loads(ec.SESSIONS_FILE.read_text(encoding="utf-8"))), {"b"})
+        self.assertEqual(list(ec.SESSIONS_FILE.parent.glob("*.tmp")), [])
+
+    def test_replace_retries_on_permission_error(self):
+        calls = []
+        real = ec.os.replace
+
+        def flaky(src, dst):
+            calls.append(1)
+            if len(calls) < 3:
+                raise PermissionError(13, "Access is denied")
+            real(src, dst)
+        with mock.patch.object(ec.os, "replace", flaky), mock.patch.object(ec.time, "sleep"):
+            self.nav()
+        self.assertGreaterEqual(len(calls), 3)
+        self.assertIn("s1", json.loads(ec.SESSIONS_FILE.read_text(encoding="utf-8")))
+
+    def test_page_action_resolves_only_the_current_tab(self):
+        self.nav()
+        for i in range(10):                     # other tabs in the browser (the user's, other sessions')
+            self.ctx.new_page().url = f"https://other.example/{i}"
+        resolved = []
+        with mock.patch.object(ec, "target_id", lambda p: resolved.append(p.tid) or p.tid):
+            ec.wb("evaluate", {"code": "1+1"}, session="s1")
+        self.assertEqual(resolved, ["T1"])      # url-matching page first, stop at the hit
+        self.assertGreaterEqual(self.ctx.target_calls, 1)
+
+    def test_live_tab_that_is_not_resolved_yet_is_not_pruned(self):
+        r = self.nav()
+        with mock.patch.object(ec, "_page_of", lambda *a, **k: None):
+            with self.assertRaises(ec.NoTab):
+                ec.wb("evaluate", {"code": "1+1"}, session="s1")
+        self.assertEqual(json.loads(ec.SESSIONS_FILE.read_text(encoding="utf-8"))["s1"]["tabs"], [r["tabId"]])
+
+
+class ConnectTimeoutTest(unittest.TestCase):
+    def test_timeout_names_the_open_tabs(self):
+        class TimeoutError(Exception):    # playwright's TimeoutError is matched by name
+            pass
+        pw = mock.Mock()
+        pw.chromium.connect_over_cdp.side_effect = TimeoutError("Timeout 10000ms exceeded")
+        old = (ec._tls.pw, ec._tls.browser)
+        ec._tls.pw, ec._tls.browser = pw, None
+        try:
+            with mock.patch.object(ec, "launch"), \
+                    mock.patch.object(ec, "open_tabs", return_value=[("ABC", "http://x.test/confirm")]):
+                with self.assertRaises(ec.WbError) as cm:
+                    ec._connect()
+            self.assertIn("dialog", str(cm.exception))
+            self.assertIn("ABC http://x.test/confirm", str(cm.exception))
+            self.assertEqual(pw.chromium.connect_over_cdp.call_args.kwargs["timeout"], ec.CONNECT_TIMEOUT_MS)
+        finally:
+            ec._tls.pw, ec._tls.browser = old
 
 
 if __name__ == "__main__":
